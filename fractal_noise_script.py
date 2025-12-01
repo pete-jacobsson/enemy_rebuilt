@@ -6,19 +6,22 @@ import noise # This is the library you installed
 from osgeo import gdal
 import tempfile
 
+
 # --- PARAMETERS TO CHANGE ---
 
 # 1. Name of your template DEM layer in the QGIS Layers Panel
-template_layer_name = "04_topo_smooth" 
+template_layer_name = "wfrp_empire_topo_high_res" 
 
 # 2. Name for the new output layer
-output_layer_name = "fractal_noise_250"
+output_layer_name = "fractal_noise_50"
 
 # 3. Noise parameters
-scale = 250.0  # Lower number = finer noise; Higher = broader features
+random_seed = 3
+scale = 50.0  # Lower number = finer noise; Higher = broader features
 octaves = 6           # Number of detail layers (6-8 is good)
 persistence = 0.5     # How much smaller details matter
 lacunarity = 2.0      # Frequency of detail layers
+mountain_noise = True # Determines whether the noise values are made positive by shift/scale or by abs()
 
 # --- END OF PARAMETERS ---
 
@@ -39,14 +42,22 @@ noise_array = np.zeros((height, width))
 for y in range(height):
     for x in range(width):
         # Calculate noise value for each pixel
-        noise_array[y][x] = noise.pnoise2(x / scale, 
+        raw_noise = noise.pnoise2(x / scale, 
                                           y / scale, 
                                           octaves=octaves, 
                                           persistence=persistence, 
                                           lacunarity=lacunarity, 
                                           repeatx=width, 
                                           repeaty=height, 
-                                          base=0)
+                                          base=random_seed)
+        if mountain_noise:
+            noise_array[y][x] = abs(raw_noise)
+        else:
+            noise_array[y][x] = (raw_noise + 1.0) / 2.0
+
+## This gives us a number between zero and some multiplier <= 1
+min_val = np.min(noise_array)
+noise_array = noise_array - min_val
 
 print("Noise generation complete. Creating raster layer...")
 
