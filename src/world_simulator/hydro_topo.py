@@ -436,9 +436,116 @@ def plot_river_hierarchy(DiG, sea_gdf, lake_gdf=None):
 
 
 
+###############################################################################
+###############################################################################
+###############################################################################
 
 
 
+def assign_river_widths(G: nx.DiGraph, 
+                        min_width: float = 10.0, 
+                        max_width: float = 500.0, 
+                        scale_factor: float = 1.5) -> gpd.GeoDataFrame:
+    """
+    Converts flow magnitude into physical river width using a logarithmic scaling function.
+    
+    FORMULA:
+    Width = Min_Width + (log(Magnitude) * Scale_Factor)
+    (Capped at max_width).
+    
+    Args:
+        G: The enriched river DiGraph (from Step 2).
+        min_width: Width of a source stream (Order 1) in meters.
+        max_width: Hard cap for the widest river in meters.
+        scale_factor: Multiplier to control widening rate.
+        
+    Returns:
+        gpd.GeoDataFrame: River vectors with a 'width' column (in meters).
+    """
+    print(f"--- Phase 3: Physical Width Derivation ---")
+    print(f"Params: Base={min_width}m, Cap={max_width}m, Scale={scale_factor}")
+    
+    river_segments = []
+    
+    # Iterate over edges
+    # We use G.edges(data=True) to access attributes
+    for u, v, data in G.edges(data=True):
+        if 'geometry' not in data:
+            continue
+            
+        # 1. Get Magnitude (Default to 1 if missing)
+        # Ensure magnitude is at least 1 to avoid log(0) errors
+        mag = max(data.get('magnitude', 1), 1)
+        
+        # 2. Apply Logarithmic Scaling
+        # Natural Log (ln) grows fast initially then slows down, mimicking real rivers
+        # formula: Base Width + (ln(Flow) * Factor)
+        calc_width = min_width + (np.log(mag) * scale_factor)
+        
+        # 3. Apply Cap
+        final_width = min(calc_width, max_width)
+        
+        # 4. Store Data
+        river_segments.append({
+            'geometry': data['geometry'],
+            'source': u,
+            'target': v,
+            'magnitude': mag,
+            'strahler': data.get('strahler', 1),
+            'width': final_width
+        })
+    
+    # 5. Convert to GeoDataFrame
+    # We assume the graph nodes store the CRS, or we grab it from the geometry if possible.
+    # Since we don't have the CRS object passed in explicitly, we will assume
+    # the user handles CRS assignment or we infer it later. 
+    # Ideally, pass CRS in or grab from a node attribute if stored.
+    # For now, we return a GDF without CRS and set it outside.
+    gdf = gpd.GeoDataFrame(river_segments)
+    
+    print(f"assigned widths to {len(gdf)} segments.")
+    print(f"Width Range: {gdf['width'].min():.2f}m to {gdf['width'].max():.2f}m")
+    
+    return gdf
+
+# --- VISUALIZER ---
+
+def plot_river_physics(width_gdf, sea_gdf, lake_gdf=None):
+    """
+    Visualizes the ACTUAL physical footprint of the rivers.
+    It buffers the lines by (width / 2) to show the river as a polygon.
+    """
+    fig, ax = plt.subplots(figsize=(15, 15), facecolor='white')
+    
+    # 1. Plot Context
+    sea_gdf.plot(ax=ax, color='#e0f7fa', edgecolor='none', zorder=1)
+    if lake_gdf is not None:
+        lake_gdf.plot(ax=ax, color='#81d4fa', edgecolor='none', zorder=2)
+        
+    # 2. Create Physical Representation (Polygons)
+    # We create a temporary column for visualization only
+    # buffer(distance) -> distance is radius, so we use width / 2
+    print("Buffering geometry for visualization...")
+    
+    # Check if CRS is projected (meters). If Lat/Lon, this visualization will fail/look huge.
+    if width_gdf.crs and not width_gdf.crs.is_projected:
+        print("WARNING: GDF is in Degrees! Buffering by meters will fail.")
+    
+    buffered_rivers = width_gdf.copy()
+    buffered_rivers['geometry'] = buffered_rivers.geometry.buffer(buffered_rivers['width'] / 2)
+    
+    # 3. Plot Rivers
+    # We color by width to emphasize the difference
+    buffered_rivers.plot(ax=ax, 
+                         column='width', 
+                         cmap='Blues', 
+                         legend=True,
+                         legend_kwds={'label': "River Width (meters)"},
+                         zorder=3)
+    
+    plt.title("Physical River Footprint (Buffered Geometry)")
+    plt.axis('equal')
+    plt.show()
 
 
 
