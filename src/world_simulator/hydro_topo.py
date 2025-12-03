@@ -152,43 +152,186 @@ class HydrologyAnalyzer:
         pbar.close()
 
     def _reconstruct_geodataframe(self) -> gpd.GeoDataFrame:
-        """Step 5: Convert DiGraph back to GeoDataFrame and fix LineString direction."""
+        """Step 5: Reconstruct with explicit logging and validation."""
         logger.info("Reconstructing geometry...")
         
         oriented_lines = []
+        flip_count = 0
+        keep_count = 0
+        weird_geometry_count = 0
         
-        for u, v, data in self.DiG.edges(data=True):
+        # Iterate over the directed edges (Flow goes u -> v)
+        for i, (u, v, data) in enumerate(self.DiG.edges(data=True)):
             original_geom = data.get('geometry')
             
             if original_geom is None:
                 continue
 
-            # Geometry Validation:
-            # We want the LineString to physically start at u and end at v
-            start_pt = Point(original_geom.coords[0])
+            # 1. Coordinate Extraction
+            # We trust the Graph (u is Source). We check the Geometry.
+            u_point = Point(u)
             
-            # Check distance to 'u' (Source). 
-            # If distance is near zero, the line is already correct.
-            # If not, it's backwards.
-            if start_pt.distance(Point(u)) < 1e-6:
+            geom_start = Point(original_geom.coords[0])
+            geom_end = Point(original_geom.coords[-1])
+            
+            # 2. Distance Check
+            dist_u_to_start = u_point.distance(geom_start)
+            dist_u_to_end = u_point.distance(geom_end)
+            
+            # 3. Decision Logic
+            # We want the geometry to start near u.
+            if dist_u_to_start < dist_u_to_end:
+                # Case A: Geometry already starts near Source. Keep it.
                 final_geom = original_geom
+                keep_count += 1
+                decision = "KEEP"
             else:
+                # Case B: Geometry starts near Target. Flip it.
                 final_geom = LineString(list(original_geom.coords)[::-1])
-                
+                flip_count += 1
+                decision = "FLIP"
+
+            # 4. DEBUG LOGGING (First 5 examples only)
+            if i < 5:
+                logger.info(f"--- River Segment {i} ---")
+                logger.info(f"  Source Node (u): {u}")
+                logger.info(f"  Geom Start: {geom_start.coords[0]}")
+                logger.info(f"  Geom End:   {geom_end.coords[0]}")
+                logger.info(f"  Dist u->Start: {dist_u_to_start:.4f}")
+                logger.info(f"  Dist u->End:   {dist_u_to_end:.4f}")
+                logger.info(f"  Decision: {decision}")
+
+            # 5. Sanity Check for "Weird" Geometries
+            # If u is far from BOTH ends, something is wrong with the graph/geom mapping
+            if min(dist_u_to_start, dist_u_to_end) > 1.0: # 1 meter tolerance
+                weird_geometry_count += 1
+                if weird_geometry_count < 5:
+                     logger.warning(f"  [WARNING] Node u is far from both ends! Min Dist: {min(dist_u_to_start, dist_u_to_end)}")
+
             oriented_lines.append({
                 'geometry': final_geom,
-                'source_node': u,
-                'target_node': v,
-                # Copy over any other attributes from original data
-                'original_id': data.get('original_id', None) 
+                'source_node': str(u),
+                'target_node': str(v),
+                'original_id': data.get('original_id', None)
             })
             
         result_gdf = gpd.GeoDataFrame(oriented_lines, crs=self.raw_rivers.crs)
         
-        dropped = len(self.exploded_rivers) - len(result_gdf)
-        logger.info(f"Reconstruction complete. Valid segments: {len(result_gdf)}. Dropped (Disconnected): {dropped}")
-        
+        logger.info(f"Reconstruction Stats:")
+        logger.info(f"  Kept Original Direction: {keep_count}")
+        logger.info(f"  Flipped Direction:       {flip_count}")
+        if weird_geometry_count > 0:
+            logger.warning(f"  'Floating' Segments (Node mismatch > 1m): {weird_geometry_count}")
+            
         return result_gdf
+
+
+
+def validate_arrow_directions(oriented_gdf, G):
+    """
+    Checks if the physical arrows align with the topological source nodes.
+    """
+    print("--- VALIDATION: Checking Arrow Directions ---")
+    
+    misaligned_count = 0
+    total = len(oriented_gdf)
+    
+    for idx, row in oriented_gdf.iterrows():
+        # Get the geometry start point (Base of the arrow)
+        geom_start = Point(row.geometry.coords[0])
+        
+        # Get the Source Node from the DataFrame columns (convert str back to tuple if needed)
+        # Note: In the previous step we converted to str for GPKG. 
+        # But we can look up the edge in the graph using the index logic or just parsing.
+        # Let's assume we can parse the string "(x, y)" back to tuple, or use the graph if available.
+        
+        # Easier way: The GDF has 'source_node' column as string "(123.1, 456.2)"
+        # We need to parse that string to calculate distance.
+        src_str = row['source_node']
+        # Remove parens and split
+        src_clean = src_str.replace('(', '').replace(')', '').split(',')
+        src_x = float(src_clean[0])
+        src_y = float(src_clean[1])
+        source_point = Point(src_x, src_y)
+        
+        # Measure distance
+        dist = geom_start.distance(source_point)
+        
+        # Threshold: If the arrow starts more than 1 meter away from the source node, 
+        # it is likely pointing the wrong way (or the node is at the other end).
+        if dist > 1.0:
+            misaligned_count += 1
+            if misaligned_count < 5:
+                print(f"FAIL at Index {idx}: Arrow Base is {dist:.2f}m away from Source Node.")
+                
+    print(f"Validation Complete.")
+    print(f"  Total Rivers: {total}")
+    print(f"  Misaligned Arrows: {misaligned_count}")
+    
+    if misaligned_count == 0:
+        print("  SUCCESS: All arrows originate at the upstream node.")
+    else:
+        print("  FAILURE: Some arrows are reversed or disconnected.")
+
+# --- RUN THE VALIDATOR ---
+# validate_arrow_directions(oriented_rivers, analyzer.G)
+
+def validate_topology_continuity(gdf):
+    """
+    Chains through the rivers to ensure the End Point of one line 
+    is physically close to the Start Point of the next line.
+    """
+    print("--- TOPOLOGY CONTINUITY CHECK ---")
+    
+    # Create a spatial index for speed
+    # We will look for lines that touch the END of the current line
+    sindex = gdf.sindex
+    
+    errors = 0
+    checked = 0
+    
+    # Check 100 random rivers to save time
+    sample = gdf.sample(100) if len(gdf) > 100 else gdf
+    
+    for idx, row in sample.iterrows():
+        # This line ends at:
+        end_pt = Point(row.geometry.coords[-1])
+        
+        # Find lines that theoretically start here (Target Node matches Source Node of others)
+        # We rely on the 'target_node' attribute string we saved
+        target_node_id = row['target_node']
+        
+        # Find downstream neighbors in the dataframe
+        downstream_rows = gdf[gdf['source_node'] == target_node_id]
+        
+        if downstream_rows.empty:
+            continue # Reached the sea or a sink
+            
+        checked += 1
+        
+        # For every downstream neighbor, the START point should be close to our END point
+        for _, down_row in downstream_rows.iterrows():
+            start_pt_down = Point(down_row.geometry.coords[0])
+            dist = end_pt.distance(start_pt_down)
+            
+            if dist > 1.0: # 1 meter tolerance
+                print(f"DISCONTINUITY at Index {idx}:")
+                print(f"  River A ends at {end_pt}")
+                print(f"  River B starts at {start_pt_down}")
+                print(f"  Gap: {dist:.2f}m")
+                print(f"  (This means River B is flowing BACKWARDS relative to River A)")
+                errors += 1
+                
+    print(f"Checked {checked} junctions.")
+    if errors == 0:
+        print("SUCCESS: Water flows continuously from line to line.")
+    else:
+        print(f"FAILURE: Found {errors} breaks in flow direction.")
+
+# Run it
+validate_topology_continuity(rivers_with_width)
+
+
 
 
 
@@ -549,8 +692,35 @@ def plot_river_physics(width_gdf, sea_gdf, lake_gdf=None):
 
 
 
+###############################################################################
+###############################################################################
+###############################################################################
 
-
+def save_hydro_network(gdf: gpd.GeoDataFrame, output_path: str):
+    """
+    Saves the river network to GPKG.
+    
+    1. Preserves Geometry Direction (Flow).
+    2. Converts Tuple IDs (Nodes) to Strings so GPKG doesn't crash.
+    """
+    print(f"Saving hydrology network to {output_path}...")
+    
+    # Work on a copy so we don't break the active notebook object
+    save_gdf = gdf.copy()
+    
+    # DATA TYPE FIX: 
+    # NetworkX nodes are often tuples: (34500.1, 56000.2)
+    # GPKG attribute tables only accept String, Int, Float.
+    # We convert source/target columns to string representation.
+    if 'source' in save_gdf.columns:
+        save_gdf['source'] = save_gdf['source'].astype(str)
+    
+    if 'target' in save_gdf.columns:
+        save_gdf['target'] = save_gdf['target'].astype(str)
+        
+    # Save to file
+    save_gdf.to_file(output_path, driver="GPKG")
+    print("Save complete.")
 
 
 

@@ -1,3 +1,3 @@
 from .river_skeletonization import run_river_skeleton_pipeline
 from .noise_tools import generate_fractal_noise, test_noise
-from .hydro_topo import HydrologyAnalyzer, plot_flow, CalculateFlowMagnitude, plot_river_hierarchy, assign_river_widths, plot_river_physics
+from .hydro_topo import HydrologyAnalyzer, validate_arrow_directions, plot_flow, CalculateFlowMagnitude, plot_river_hierarchy, assign_river_widths, plot_river_physics, save_hydro_network
