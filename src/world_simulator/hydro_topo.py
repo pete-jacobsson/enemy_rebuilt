@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib import cm
 import momepy
+import noise
 
 import rasterio
 from rasterio import features
@@ -982,16 +983,6 @@ def save_hydro_network(gdf: gpd.GeoDataFrame, output_path: str):
 ###############################################################################
 ###############################################################################
 
-@dataclass
-class NoiseRule:
-    """
-    Defines a specific layer of noise to be added to the terrain.
-    """
-    seed: int
-    multiplier: float           # The vertical scale of the noise (e.g., 400.0)
-    scale_frequency: float      # The horizontal frequency (e.g., 100.0)
-    min_elevation: float = -99999.0 # Apply only above this altitude (from Base DEM)
-    mask_layer: str = None      # Optional: Name of a mask (e.g., 'north') to restrict application
 
 def vector_to_mask(vector_gdf: gpd.GeoDataFrame, reference_profile: Dict) -> np.ndarray:
     """
@@ -1137,38 +1128,138 @@ def flatten_lakes_smart(dem_array: np.ndarray, lakes_mask: np.ndarray) -> np.nda
 
 
 
+
+@dataclass
+class NoiseRule:
+    """
+    Defines a specific layer of fractal noise to be added to the terrain.
+    """
+    seed: int
+    multiplier: float           # Vertical scale (e.g., 800.0)
+    scale: float                # Horizontal scale (e.g., 50.0 for mountains, 400.0 for hills)
+    min_elevation: float = -99999.0  # Apply only above this altitude in Base DEM
+    mask_layer: str = None      # Name of mask in mask_library (e.g., 'north')
+    octaves: int = 6
+    persistence: float = 0.5
+    lacunarity: float = 2.0
+
+def _generate_noise_in_memory(shape: tuple, scale: float, seed: int, 
+                              octaves: int, persistence: float, lacunarity: float) -> np.ndarray:
+    """
+    Private helper to generate 2D Perlin noise directly into a NumPy array.
+    Returns values normalized roughly between 0 and 1 (or absolute billowy noise).
+    """
+    height, width = shape
+    arr = np.zeros((height, width), dtype=np.float32)
+    
+    # We use tqdm here because noise generation is CPU intensive
+    for y in tqdm(range(height), desc=f"Generating Noise (Scale {scale})", leave=False):
+        for x in range(width):
+            # Using 'mountain_mode' logic (abs) by default as it looks best for terrain
+            val = noise.pnoise2(
+                x / scale,
+                y / scale,
+                octaves=octaves,
+                persistence=persistence,
+                lacunarity=lacunarity,
+                repeatx=width,
+                repeaty=height,
+                base=seed
+            )
+            arr[y][x] = abs(val) # Billowy noise
+            
+    # # Normalize to 0.0 - 1.0 range based on actual min/max generated
+    # # This ensures the 'multiplier' in the rule implies a consistent height addition
+    # arr_min, arr_max = arr.min(), arr.max()
+    # if arr_max > arr_min:
+    #     arr = (arr - arr_min) / (arr_max - arr_min)
+        
+    return arr
+
 def apply_noise_rules(base_dem: np.ndarray, 
-                      profile: Dict, 
                       rules: List[NoiseRule], 
                       mask_library: Dict[str, np.ndarray] = {}) -> np.ndarray:
     """
-    The Master Compositor. Stacks multiple noise layers onto the base DEM 
-    based on elevation thresholds and spatial masks.
-
-    Algorithm:
-    1. Start with a copy of Base DEM.
-    2. Iterate through 'rules':
-       a. Generate a noise array in-memory using the rule's Seed and Scale.
-       b. Scale the noise: noise = noise * rule.multiplier.
-       c. Create a 'Application Mask' (Boolean):
-          - Initialize True.
-          - IF rule.min_elevation is set: AND with (Base_DEM >= min_elevation).
-          - IF rule.mask_layer is set: AND with (mask_library[rule.mask_layer]).
-       d. Add noise: Final_DEM += (Noise * Application_Mask).
+    The Master Compositor. Stacks multiple noise layers onto the base DEM.
+    
+    LOGIC UPDATE:
+    - If a rule has BOTH min_elevation AND a mask_layer, they are combined with OR (|).
+      (e.g., "Apply if > 500m OR inside North mask").
+    - If a rule has only one, it applies that one.
+    - If a rule has neither, it applies everywhere.
     
     Args:
         base_dem: The starting topography (NumPy array).
-        profile: Rasterio profile (needed for noise generation dimensions).
         rules: List of NoiseRule objects defining the layers.
         mask_library: Dictionary mapping names ('north', 'sea') to Numpy Boolean Arrays.
         
     Returns:
         np.ndarray: The final composite terrain.
     """
-    pass
+    logger.info(f"Applying {len(rules)} noise rules to base terrain...")
+    
+    # 1. Copy Base DEM (Float32 for precision)
+    final_dem = base_dem.astype(np.float32).copy()
+    height, width = final_dem.shape
+    
+    for i, rule in enumerate(rules):
+        logger.info(f"  Rule {i+1}: Scale={rule.scale}, Mult={rule.multiplier}, Seed={rule.seed}")
+        
+        # 2. Generate Raw Noise
+        raw_noise = _generate_noise_in_memory(
+            shape=(height, width),
+            scale=rule.scale,
+            seed=rule.seed,
+            octaves=rule.octaves,
+            persistence=rule.persistence,
+            lacunarity=rule.lacunarity
+        )
+        
+        # 3. Scale Noise
+        scaled_noise = raw_noise * rule.multiplier
+        
+        # 4. Build Application Mask (The OR Logic)
+        
+        # Check which conditions are active
+        has_elevation = rule.min_elevation > -9999.0
+        has_mask = (rule.mask_layer is not None)
+        
+        # Resolve the mask layer if it exists
+        spatial_mask = None
+        if has_mask:
+            if rule.mask_layer in mask_library:
+                spatial_mask = mask_library[rule.mask_layer]
+            else:
+                logger.warning(f"    Mask '{rule.mask_layer}' not found! Ignoring mask condition.")
+                has_mask = False
 
+        # Combine Conditions
+        if has_elevation and has_mask:
+            # Elevation OR Mask
+            elevation_mask = (base_dem >= rule.min_elevation)
+            app_mask = elevation_mask | spatial_mask
+            logger.info(f"    Filtered by Elevation > {rule.min_elevation} OR Mask '{rule.mask_layer}'")
+            
+        elif has_elevation:
+            # Only Elevation
+            app_mask = (base_dem >= rule.min_elevation)
+            logger.info(f"    Filtered by Elevation > {rule.min_elevation}")
+            
+        elif has_mask:
+            # Only Mask
+            app_mask = spatial_mask
+            logger.info(f"    Filtered by Mask '{rule.mask_layer}'")
+            
+        else:
+            # No filters -> Global
+            app_mask = np.ones((height, width), dtype=bool)
+            logger.info(f"    No filters (Global application)")
 
-
+        # 5. Apply
+        final_dem[app_mask] += scaled_noise[app_mask]
+        
+    logger.info("Terrain composition complete.")
+    return final_dem
 
 
 
