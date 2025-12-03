@@ -14,6 +14,17 @@ from centerline.geometry import Centerline
 import momepy
 import networkx as nx
 
+import logging
+from .logger import setup_logger  # <--- Import your new tool
+
+###############################################################################
+
+logger = logging.getLogger(__name__)
+
+
+
+setup_logger(log_name="wfrp_phys_geo")
+
 
 ###############################################################################
 
@@ -23,13 +34,13 @@ def load_and_project(filepath: str, processing_epsg: int = None) -> Tuple[gpd.Ge
     If the file is already in a projected (metric) CRS, it keeps it as is.
     Only reprojects if the data is Geographic (Lat/Lon) or if a specific EPSG is forced.
     """
-    print(f"Reading {filepath}...")
+    logger.info(f"Reading {filepath}...")
     gdf = gpd.read_file(filepath)
     original_crs = gdf.crs
 
     # CHECK 1: Is it already projected? (Meters/Feet/etc)
     if gdf.crs.is_projected and processing_epsg is None:
-        print(f"Data is already projected ({gdf.crs.name}). Keeping original CRS.")
+        logger.info(f"Data is already projected ({gdf.crs.name}). Keeping original CRS.")
         # We return the same CRS for both to indicate no reprojection needed at the end
         return gdf, original_crs
 
@@ -45,7 +56,7 @@ def load_and_project(filepath: str, processing_epsg: int = None) -> Tuple[gpd.Ge
 
     # CHECK 3: User forced a specific EPSG (Only use if you are sure)
     if processing_epsg is not None and gdf.crs.to_epsg() != processing_epsg:
-        print(f"WARNING: Reprojecting to EPSG:{processing_epsg}. "
+        logger.info(f"WARNING: Reprojecting to EPSG:{processing_epsg}. "
               "Ensure this EPSG matches your planet's ellipsoid!")
         gdf = gdf.to_crs(epsg=processing_epsg)
         
@@ -58,7 +69,7 @@ def bridge_discontinuous_polygons(gdf: gpd.GeoDataFrame, gap_tolerance: float) -
     Performs morphological closing (Buffer -> Union -> Negative Buffer)
     to connect adjacent polygons.
     """
-    print(f"Bridging gaps with a tolerance of {gap_tolerance} meters...")
+    logger.info(f"Bridging gaps with a tolerance of {gap_tolerance} meters...")
     
     # 1. Dilate (Buffer)
     # Buffering creates rounded corners; cap_style=3 (square) can sometimes help 
@@ -79,7 +90,7 @@ def bridge_discontinuous_polygons(gdf: gpd.GeoDataFrame, gap_tolerance: float) -
     new_gdf = gpd.GeoDataFrame(geometry=[eroded_geom], crs=gdf.crs)
     new_gdf = new_gdf.explode(index_parts=False).reset_index(drop=True)
     
-    print(f"Merged into {len(new_gdf)} continuous river system(s).")
+    logger.info(f"Merged into {len(new_gdf)} continuous river system(s).")
     return new_gdf
 
 ###############################################################################
@@ -89,7 +100,7 @@ def simplify_geometries(gdf: gpd.GeoDataFrame, tolerance: float) -> gpd.GeoDataF
     Simplifies the geometries to remove 'buffer bloat' (unnecessary vertices).
     This significantly speeds up downstream processing.
     """
-    print(f"Simplifying geometries with tolerance {tolerance}...")
+    logger.info(f"Simplifying geometries with tolerance {tolerance}...")
     
     # We copy to avoid SettingWithCopy warnings
     cleaned_gdf = gdf.copy()
@@ -132,8 +143,8 @@ class VoronoiSkeletonizer(BaseSkeletonizer):
 
     def run(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         n_cores = max(1, cpu_count() - 1)
-        print(f"Skeletonizing using Voronoi Method on {n_cores} cores...")
-        print(f"Vertex Density: {self.interp_dist}m")
+        logger.info(f"Skeletonizing using Voronoi Method on {n_cores} cores...")
+        logger.info(f"Vertex Density: {self.interp_dist}m")
 
         geometries = gdf.geometry.tolist()
         
@@ -156,7 +167,7 @@ class VoronoiSkeletonizer(BaseSkeletonizer):
 
 
 
-def prune_short_tributaries(gdf: gpd.GeoDataFrame, min_length: float) -> gpd.GeoDataFrame:
+def prune_short_tributaries(gdf: gpd.GeoDataFrame, min_length: float, max_iters: int = 100) -> gpd.GeoDataFrame:
     """
     Strategy 1: Recursive Leaf Pruning (The 'Haircut').
     
@@ -169,66 +180,57 @@ def prune_short_tributaries(gdf: gpd.GeoDataFrame, min_length: float) -> gpd.Geo
     :param gdf: GeoDataFrame containing river centerlines (LineStrings)
     :param min_length: Threshold in meters. Anything shorter is cut.
     """
-    print(f"Pruning tributaries shorter than {min_length}m...")
+    logger.info(f"Pruning tributaries shorter than {min_length}m (Max iterations: {max_iters})...")
     
-    # 1. Explode to ensure we have simple LineStrings (edges), not MultiLineStrings
-    # This is critical because 'Centerline' often outputs MultiLineStrings
+    # 1. Convert to Graph
     exploded_gdf = gdf.explode(index_parts=False).reset_index(drop=True)
-    
-    # 2. Convert to NetworkX Graph
-    # 'primal=True' means Nodes=Intersections, Edges=Lines
-    # momepy handles coordinate snapping automatically
     G = momepy.gdf_to_nx(exploded_gdf, approach='primal')
     
-    # 3. Recursive Pruning Loop
+    # 2. Recursive Pruning Loop
     clean_pass = 0
-    while True:
-        # Find all nodes with degree 1 (endpoints/leaves)
-        # We perform this check inside the loop because removing an edge might
-        # create *new* degree-1 nodes (the recursive part)
+    
+    while clean_pass < max_iters:
+        # Find leaves (degree 1)
         leaves = [node for node, degree in G.degree() if degree == 1]
-        
         edges_to_remove = []
         
         for leaf in leaves:
-            # Get the neighbor node (there is only 1 because degree is 1)
-            neighbor = list(G.neighbors(leaf))[0]
+            # Handle isolated nodes (degree 0) just in case
+            neighbors = list(G.neighbors(leaf))
+            if not neighbors: continue
+                
+            neighbor = neighbors[0]
             
-            # Get edge data (attributes)
-            # Momepy stores the original line geometry/attributes in the edge
+            # Access edge data (handling MultiGraph potential)
+            # We take the first edge found between these nodes
             edge_data = G.get_edge_data(leaf, neighbor)
+            key = list(edge_data.keys())[0] # Usually 0
+            attributes = edge_data[key]
             
-            # Note: momepy/nx might store multiple edges between nodes (MultiGraph),
-            # but for rivers, it's usually a simple Graph. 
-            # We access key 0 (the first edge).
-            edge_attributes = edge_data[0] if 0 in edge_data else edge_data
-            
-            # Calculate length if not present (momepy usually adds 'mm_len')
-            # But we can just use the geometry length to be safe
-            geom = edge_attributes.get('geometry')
+            geom = attributes.get('geometry')
             length = geom.length if geom else 0
             
             if length < min_length:
                 edges_to_remove.append((leaf, neighbor))
         
+        # Exit condition: No short leaves found
         if not edges_to_remove:
-            # Exit condition: No short leaves found in this pass
+            logger.info(f"Pruning converged after {clean_pass} passes.")
             break
             
-        # Remove the edges (and the isolated leaf nodes)
+        # Remove edges
         G.remove_edges_from(edges_to_remove)
-        
-        # Clean up isolated nodes (nodes with no edges left)
         G.remove_nodes_from(list(nx.isolates(G)))
         
         clean_pass += 1
-        print(f"  Pass {clean_pass}: Removed {len(edges_to_remove)} short segments.")
+        logger.debug(f"Pass {clean_pass}: Removed {len(edges_to_remove)} segments.")
 
-    # 4. Convert back to GeoDataFrame
-    print("Reconstructing river network...")
+    if clean_pass >= max_iters:
+        logger.warning(f"Pruning hit max_iters ({max_iters})! Some artifacts may remain.")
+
+    # 3. Reconstruct
+    logger.info("Reconstructing river network...")
     clean_gdf = momepy.nx_to_gdf(G, points=False, lines=True)
-    
-    # Momepy might lose the CRS, so we restore it
     clean_gdf.set_crs(gdf.crs, inplace=True)
     
     return clean_gdf
@@ -252,8 +254,8 @@ def save_results(gdf: gpd.GeoDataFrame, output_path: str, target_crs: any):
 
 def run_river_skeleton_pipeline(input_file: str, output_file: str, 
                        gap_size: float, interp_dist: float, 
-                       prune_threshold: float = 2000, 
-                       strahler_filter: bool = False): # e.g. 2km pruning
+                       prune_threshold: float = 5000, 
+                       prune_iterations: int = 100): # e.g. 2km pruning
     
     # 1. Load
     gdf, orig_crs = load_and_project(input_file, processing_epsg=None)
@@ -269,16 +271,9 @@ def run_river_skeleton_pipeline(input_file: str, output_file: str,
     lines_gdf = skeletonizer.run(cleaned_gdf)
     
     # 5. NEW STEP: Prune The Hair (The Haircut)
-    # ---------------------------------------------------------
-    if strahler_filter:
-        # Strategy 3: Strahler Filter
-        # Order 1 = The tiniest twigs.
-        # Order 2 = Formed by two Order 1s joining.
-        # Filtering >= 2 removes all simple dead-ends but keeps significant flows.
-        clean_gdf = filter_by_strahler(lines_gdf, min_order=2)
-    else:
-        # Strategy 1: Length Filter
-        clean_gdf = prune_short_tributaries(lines_gdf, min_length=2000)
+    clean_gdf = prune_short_tributaries(lines_gdf, 
+                                        min_length=prune_threshold,
+                                        max_iters=prune_iterations)
     # ---------------------------------------------------------
     
     # 6. Save (Save the PRUNED version)
