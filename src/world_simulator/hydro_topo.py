@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import geopandas as gpd
 import logging
 
@@ -8,13 +9,19 @@ from matplotlib.colors import Normalize
 from matplotlib import cm
 import momepy
 
+import rasterio
+from rasterio import features
+
 import networkx as nx
 import numpy as np
+import pandas as pd
 
+from scipy import ndimage
 import shapely
 from shapely.geometry import Point, LineString
 
 from tqdm import tqdm
+from typing import List, Optional, Union, Dict, Any
 
 
 # Ensure we have a logger
@@ -27,209 +34,339 @@ setup_logger(log_name="wfrp_phys_geo")
 ###############################################################################
 ###############################################################################
 
-
 class HydrologyAnalyzer:
     """
-    A stateful engine that converts a raw, undirected river network into a 
-    hydrologically oriented Directed Acyclic Graph (DAG).
+    v2.0: Physical Interface Approach.
+    
+    Strategy:
+    1. Clip Rivers by Sea/Lakes (Remove overlaps).
+    2. Walk Upstream from Sea Interfaces.
+    3. Bridge across Lakes.
+    4. Walk Upstream from Lake Inlets.
+    5. Discard anything not connected to the sea.
     """
     
-    def __init__(self, river_gdf: gpd.GeoDataFrame, sea_gdf: gpd.GeoDataFrame, lake_gdf: gpd.GeoDataFrame = None):
+    def __init__(self, river_gdf: gpd.GeoDataFrame, sea_gdf: gpd.GeoDataFrame, lake_gdf: gpd.GeoDataFrame):
         self.raw_rivers = river_gdf
         self.sea = sea_gdf
         self.lakes = lake_gdf
         
-        # Internal State
-        self.G = None       # The undirected base graph
-        self.DiG = None     # The directed result graph
-        self.sinks = set()  # Set of nodes that drain to sea
+        # State
+        self.clean_rivers = None
+        self.G = None           # Undirected
+        self.DiG = None         # Directed
+        self.visited = set()    # Nodes confirmed connected to sea
+        
+        # Interfaces
+        self.sea_nodes = set()
+        self.lake_nodes = {}    # {node_id: lake_index}
         
     def run(self) -> gpd.GeoDataFrame:
-        """
-        Orchestrates the analysis pipeline.
-        """
-        logger.info("--- Phase 1: Hydrological Orientation (Class-Based) ---")
+        logger.info("--- Phase 1: Hydrology v2.0 (Physical Clip Strategy) ---")
         
-        self._build_base_topology()
+        # 1. Physical Cleanup
+        self._preprocess_geometry()
+        self._build_graph()
         
-        if self.lakes is not None:
-            self._add_virtual_lake_connections()
-            
-        self._identify_sea_sinks()
-        self._orient_network_bfs()
+        # 2. Identify Interfaces
+        # self._identify_interfaces()
         
+        # 3. Primary Walk (Sea -> Land)
+        self._propagate_flow_from_sea()
+        
+        # 4. Secondary Walk (Lake -> Land)
+        self._propagate_flow_from_lakes()
+        
+        # 5. Reconstruct
         return self._reconstruct_geodataframe()
 
-    def _build_base_topology(self):
-        """Step 1: Convert LineStrings to an undirected NetworkX graph."""
-        logger.info("Building base topology...")
-        # Explode to ensure simple lines
-        self.exploded_rivers = self.raw_rivers.explode(index_parts=False).reset_index(drop=True)
-        # Primal approach: Nodes = Junctions, Edges = Rivers
-        self.G = momepy.gdf_to_nx(self.exploded_rivers, approach='primal')
-
-    def _add_virtual_lake_connections(self):
-        """Step 2: Bridge gaps by connecting river mouths/sources to lake centers."""
-        logger.info("Integrating canonical lakes...")
-        
-        # Get graph nodes as geometry
-        node_points = [Point(n) for n in self.G.nodes]
-        node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.raw_rivers.crs)
-        
-        # Spatial Join: Find nodes touching lakes
-        lake_nodes = gpd.sjoin(node_gdf, self.lakes, how='inner', predicate='intersects')
-        
-        count = 0
-        for lake_idx, group in lake_nodes.groupby('index_right'):
-            # Create Virtual Node at Lake Centroid
-            lake_geom = self.lakes.geometry.iloc[lake_idx]
-            virtual_node = (lake_geom.centroid.x, lake_geom.centroid.y)
-            
-            self.G.add_node(virtual_node, type='virtual_lake')
-            
-            # Connect real nodes to virtual node with 0 weight
-            for real_node in group.node_id:
-                self.G.add_edge(real_node, virtual_node, weight=0, type='virtual_connection')
-                self.G.add_edge(virtual_node, real_node, weight=0, type='virtual_connection')
-                count += 1
-                
-        logger.info(f"Added {count} connections to virtual lake nodes.")
-
-    def _identify_sea_sinks(self):
+    def _preprocess_geometry(self):
         """
-        Step 3: Find nodes that touch the sea polygon.
-        FIX: Tries Strict Mode (Degree 1) first. If 0 found, falls back to Loose Mode.
+        Step 1: FILTERING Strategy (The 'Leg in the Sea').
+        
+        Logic:
+        1. Identify segments COMPLETELY inside Sea/Lakes -> Delete them (Noise).
+        2. Identify segments PARTIALLY inside Sea/Lakes -> Keep them (The Anchor Legs).
+        3. Identify segments COMPLETELY outside -> Keep them (Inland Rivers).
         """
-        logger.info("Identifying discharge points...")
+        logger.info("Step 1: Filtering geometry (Removing fully submerged segments)...")
         
-        node_points = [Point(n) for n in self.G.nodes]
-        node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.sea.crs)
+        # 1. Prepare Water Polygon (Sea + Lakes)
+        # We assume sea_gdf and lake_gdf are Polygons.
+        # We explicitly specificy the columns to avoid index collision errors in sjoin
+        sea_geom = self.sea[['geometry']].copy()
+        lake_geom = self.lakes[['geometry']].copy()
+        water = pd.concat([sea_geom, lake_geom], ignore_index=True)
         
-        # 1. Broad Phase: Find ALL nodes touching the sea
-        matches = gpd.sjoin(node_gdf, self.sea, how='inner', predicate='intersects')
-        candidate_sinks = set(matches.node_id.tolist())
+        # 2. Identify "Fully Submerged" Segments (Noise)
+        # Predicate 'within': The river segment is 100% inside the water.
+        fully_inside_indices = []
         
-        logger.info(f"  Nodes touching sea: {len(candidate_sinks)}")
+        # processing in chunks or using sjoin is faster than iterating
+        inside_matches = gpd.sjoin(self.raw_rivers, water, how='inner', predicate='within')
+        fully_inside_indices = inside_matches.index.unique()
         
-        if not candidate_sinks:
-            logger.warning("CRITICAL: No river nodes intersect the sea polygon!")
-            self.sinks = set()
-            return
+        logger.info(f"  Found {len(fully_inside_indices)} segments fully inside water (to be removed).")
+        
+        # 3. Filter the Dataframe
+        # We keep everything that is NOT in the 'fully_inside' list.
+        # This preserves the "Legs" (partially inside) and "Inland" (fully outside).
+        self.clean_rivers = self.raw_rivers.drop(fully_inside_indices).reset_index(drop=True)
+        
+        logger.info(f"  Filtering complete. {len(self.raw_rivers)} -> {len(self.clean_rivers)} segments.")
+        
+        # 4. Identify The "Legs" (Interface Segments) for Phase 2
+        # Now we look for segments that INTERSECT the sea in the *cleaned* dataset.
+        # These are our starting anchors.
+        self.sea_legs_indices = []
+        
+        # Using sjoin again on the clean set
+        sea_intersects = gpd.sjoin(self.clean_rivers, self.sea[['geometry']], how='inner', predicate='intersects')
+        self.sea_legs_indices = sea_intersects.index.unique()
+        
+        logger.info(f"  Identified {len(self.sea_legs_indices)} 'Legs in the Sea' (Anchor Segments).")
 
-        # 2. Strict Phase: Degree Filter (Prefer Dead Ends)
-        valid_sinks = set()
+    def _build_graph(self):
+        """Builds the undirected graph from the cleaned lines."""
+        logger.info("  Building topology from clipped vectors...")
+        self.G = momepy.gdf_to_nx(self.clean_rivers, approach='primal')
+
+    def _orient_anchor_segment(self, line_geom, water_geom):
+        """
+        Helper: Given a LineString and a Water Polygon (Sea/Lake), 
+        determine which end is the sink (in water) and which is the source (on land).
         
-        for node in candidate_sinks:
-            # Check degree in undirected graph
-            degree = self.G.degree(node)
-            if degree == 1:
-                valid_sinks.add(node)
-                
-        # 3. Fallback Logic
-        if len(valid_sinks) > 0:
-            self.sinks = valid_sinks
-            logger.info(f"  Strict Mode: Using {len(self.sinks)} Degree-1 sinks.")
+        Returns:
+            (source_node, target_node) -> The Flow Direction (Land -> Water)
+            OR
+            None (if ambiguous/error)
+        """
+        start_pt = Point(line_geom.coords[0])
+        end_pt = Point(line_geom.coords[-1])
+        
+        # Check intersection with water
+        # Note: We use 'intersects' because the point might be exactly on the boundary
+        # due to the previous cleaning step, or slightly inside.
+        start_in_water = start_pt.intersects(water_geom)
+        end_in_water = end_pt.intersects(water_geom)
+        
+        if start_in_water and not end_in_water:
+            # Start is Sink. Flow is End(Land) -> Start(Water).
+            return (line_geom.coords[-1], line_geom.coords[0])
+            
+        elif end_in_water and not start_in_water:
+            # End is Sink. Flow is Start(Land) -> End(Water).
+            return (line_geom.coords[0], line_geom.coords[-1])
+            
         else:
-            # Fallback to everyone if strict mode failed
-            self.sinks = candidate_sinks
-            logger.warning(f"  Strict Mode failed (0 sinks). Falling back to {len(self.sinks)} coastal intersections.")
+            # Ambiguous case: Both in water (should be filtered) or Both on land (touching edge).
+            # In 'Leg in the Sea' strategy, valid anchors usually have one clearly inside/touching.
+            return None
 
-    def _orient_network_bfs(self):
-        """Step 4: Reverse BFS from Sea Sinks to orient flow direction."""
-        logger.info("Orienting flow direction (Sea -> Source)...")
+    def _propagate_flow_from_sea(self):
+        """
+        Step 3: Anchor Strategy - Primary Walk.
+        
+        1. Find river segments that intersect the Sea.
+        2. Orient them (Land -> Sea).
+        3. Walk upstream from the Land Node.
+        4. Stop if we hit a Lake.
+        """
+        logger.info("Step 3: Walking upstream from Sea Anchors...")
         
         self.DiG = nx.DiGraph()
-        queue = list(self.sinks)
-        visited = set(self.sinks)
+        self.visited = set()
+        queue = []
         
-        # Progress bar
-        pbar = tqdm(total=len(self.G.nodes), desc="Orienting")
+        # --- A. Identify Sea Anchors ---
+        # Find lines touching the sea
+        # We need the geometry of the sea to check endpoints
+        sea_union = self.sea.unary_union
         
-        while queue:
-            current_node = queue.pop(0)
-            pbar.update(1)
-            
-            # Look at neighbors in the Undirected Graph
-            neighbors = list(self.G.neighbors(current_node))
-            
-            for nbr in neighbors:
-                if nbr not in visited:
-                    # If we are at 'current' and found 'nbr', then flow is Nbr -> Current
-                    
-                    # Handle Momepy MultiGraph structure (get first edge key)
-                    edge_data = self.G.get_edge_data(nbr, current_node)
-                    base_data = edge_data[0] if 0 in edge_data else edge_data
-                    
-                    # Check if this is a virtual lake connection
-                    is_virtual = (self.G.nodes[current_node].get('type') == 'virtual_lake') or \
-                                 (self.G.nodes[nbr].get('type') == 'virtual_lake')
-                    
-                    # We only add REAL rivers to the final directed graph
-                    if not is_virtual:
-                        self.DiG.add_edge(nbr, current_node, **base_data)
-                    
-                    # We traverse everything (including lakes) to find upstream sources
-                    visited.add(nbr)
-                    queue.append(nbr)
+        # Sjoin to find candidate segments
+        candidates = gpd.sjoin(self.clean_rivers, self.sea[['geometry']], how='inner', predicate='intersects')
         
-        pbar.close()
+        logger.info(f"  Found {len(candidates)} candidate anchor segments connecting to Sea.")
 
-    def _reconstruct_geodataframe(self) -> gpd.GeoDataFrame:
-        """Step 5: Reconstruct with explicit logging and validation."""
-        logger.info("Reconstructing geometry...")
-        
-        oriented_lines = []
-        flip_count = 0
-        keep_count = 0
-        weird_geometry_count = 0
-        
-        # Iterate over the directed edges (Flow goes u -> v)
-        for i, (u, v, data) in enumerate(self.DiG.edges(data=True)):
-            original_geom = data.get('geometry')
+        # --- B. Initialize Queue from Anchors ---
+        for idx, row in candidates.iterrows():
+            geom = row.geometry
             
-            if original_geom is None:
+            # Use Helper to figure out direction
+            orientation = self._orient_anchor_segment(geom, sea_union)
+            
+            if orientation:
+                source, target = orientation # Source is Land, Target is Sea
+                
+                # Add this first edge to the Directed Graph
+                # We define flow as Land -> Sea (Source -> Target)
+                # Find the graph edge key
+                if self.G.has_edge(source, target):
+                    edge_data = self.G.get_edge_data(source, target)
+                    base_data = edge_data[0] if 0 in edge_data else edge_data
+                    self.DiG.add_edge(source, target, **base_data)
+                    
+                    self.visited.add(target) # The sea node is 'done'
+                    self.visited.add(source) # The land node is visited
+                    
+                    # Seed the queue with the LAND node to walk upstream
+                    queue.append(source)
+
+        logger.info(f"  Seeded queue with {len(queue)} coastal nodes. Starting upstream walk...")
+
+        # --- C. BFS Upstream ---
+        self._run_upstream_bfs(queue, stop_at_lakes=True)
+
+
+    def _propagate_flow_from_lakes(self):
+        """
+        Step 4: Anchor Strategy - Secondary Walk.
+        
+        1. Identify Lakes that are 'Active' (connected to the sea).
+        2. Find river segments intersecting those lakes.
+        3. Orient them (Land -> Lake).
+        4. Walk upstream.
+        """
+        logger.info("Step 4: Walking upstream from Connected Lakes...")
+        
+        # 1. Identify Lake Nodes to define 'Active' Lakes
+        # We need a quick lookup of which nodes touch which lakes
+        node_points = [Point(n) for n in self.G.nodes]
+        node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.raw_rivers.crs)
+        lake_nodes_gdf = gpd.sjoin(node_gdf, self.lakes, how='inner', predicate='intersects')
+        
+        # 2. Find Connected Lakes
+        # A lake is connected if ANY of its boundary nodes were visited in the Sea Walk
+        connected_lake_indices = set()
+        
+        for _, row in lake_nodes_gdf.iterrows():
+            if row['node_id'] in self.visited:
+                connected_lake_indices.add(row['index_right'])
+                
+        if not connected_lake_indices:
+            logger.warning("  No lakes found connected to the sea network.")
+            return
+
+        logger.info(f"  Found {len(connected_lake_indices)} lakes connected to the main network.")
+        
+        # 3. Filter Lakes to only the connected ones
+        active_lakes = self.lakes.iloc[list(connected_lake_indices)]
+        lakes_union = active_lakes.unary_union
+        
+        # 4. Find Anchors (Rivers flowing INTO these lakes)
+        # We look for unvisited rivers touching these lakes
+        candidates = gpd.sjoin(self.clean_rivers, active_lakes[['geometry']], how='inner', predicate='intersects')
+        
+        queue = []
+        
+        for idx, row in candidates.iterrows():
+            geom = row.geometry
+            
+            # Optimization: Skip if we already oriented this line (e.g. the outlet)
+            # We check endpoints against visited
+            u, v = geom.coords[0], geom.coords[-1]
+            if u in self.visited and v in self.visited:
                 continue
 
-            # 1. Coordinate Extraction
-            # We trust the Graph (u is Source). We check the Geometry.
+            # Orient: Land -> Lake
+            orientation = self._orient_anchor_segment(geom, lakes_union)
+            
+            if orientation:
+                source, target = orientation # Source is Land, Target is Lake
+                
+                # Check if we already visited the Land Source (loop/redundant)
+                if source in self.visited: 
+                    continue
+                    
+                if self.G.has_edge(source, target):
+                    edge_data = self.G.get_edge_data(source, target)
+                    base_data = edge_data[0] if 0 in edge_data else edge_data
+                    self.DiG.add_edge(source, target, **base_data)
+                    
+                    self.visited.add(target) 
+                    self.visited.add(source)
+                    queue.append(source)
+                    
+        logger.info(f"  Seeded queue with {len(queue)} lake-inlet nodes.")
+        
+        # 5. BFS Upstream (No need to stop at lakes anymore, or maybe we do for nested lakes?)
+        # For simplicity, we don't stop at nested lakes in this pass, or we recurse. 
+        # Let's set stop_at_lakes=True if you have chains of lakes (Lake -> River -> Lake).
+        self._run_upstream_bfs(queue, stop_at_lakes=True)
+
+
+    def _run_upstream_bfs(self, queue, stop_at_lakes=False):
+        """
+        Shared logic for walking upstream from a set of starting nodes.
+        """
+        # Pre-calculate lake node set for fast lookup if stopping
+        lake_stop_set = set()
+        if stop_at_lakes:
+            # Get all nodes touching ANY lake
+            node_points = [Point(n) for n in self.G.nodes]
+            node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.raw_rivers.crs)
+            matches = gpd.sjoin(node_gdf, self.lakes, how='inner', predicate='intersects')
+            lake_stop_set = set(matches.node_id.tolist())
+
+        while queue:
+            curr = queue.pop(0) # BFS
+            
+            # Find neighbors in the Undirected Graph
+            neighbors = list(self.G.neighbors(curr))
+            
+            for nbr in neighbors:
+                if nbr in self.visited:
+                    continue
+                
+                # ORIENTATION LOGIC:
+                # We are at 'curr' (Downstream). 'nbr' is new.
+                # Therefore flow is nbr -> curr (Upstream -> Downstream).
+                
+                edge_data = self.G.get_edge_data(nbr, curr)
+                base_data = edge_data[0] if 0 in edge_data else edge_data
+                self.DiG.add_edge(nbr, curr, **base_data)
+                
+                self.visited.add(nbr)
+                
+                # STOPPING CONDITION
+                if stop_at_lakes and nbr in lake_stop_set:
+                    # 'nbr' is a Lake Node. We reached an inlet.
+                    # We oriented the edge flowing INTO the lake, but we stop walking.
+                    # This lake will be picked up in the next phase (if recursive).
+                    continue
+                else:
+                    queue.append(nbr)
+
+                # # --- DEBUG: FORCE SINGLE BRANCH ---
+                # break # <--- ADD THIS HERE
+                # # This forces the walker to pick ONLY the first valid upstream neighbor
+                # # and ignore any forks.
+                # # ----------------------------------
+
+    def _reconstruct_geodataframe(self) -> gpd.GeoDataFrame:
+        """Step 5: Reconstruct and UPDATE GRAPH GEOMETRY."""
+        logger.info("Step 5: Reconstructing and syncing graph geometry...")
+        
+        oriented_lines = []
+        
+        # Iterate over directed edges: u (Source) -> v (Target)
+        for u, v, data in self.DiG.edges(data=True):
+            original_geom = data.get('geometry')
+            if original_geom is None: continue
+
             u_point = Point(u)
+            start_pt = Point(original_geom.coords[0])
+            end_pt = Point(original_geom.coords[-1])
             
-            geom_start = Point(original_geom.coords[0])
-            geom_end = Point(original_geom.coords[-1])
-            
-            # 2. Distance Check
-            dist_u_to_start = u_point.distance(geom_start)
-            dist_u_to_end = u_point.distance(geom_end)
-            
-            # 3. Decision Logic
-            # We want the geometry to start near u.
-            if dist_u_to_start < dist_u_to_end:
-                # Case A: Geometry already starts near Source. Keep it.
+            # Robust Orientation Check
+            if u_point.distance(start_pt) < u_point.distance(end_pt):
                 final_geom = original_geom
-                keep_count += 1
-                decision = "KEEP"
             else:
-                # Case B: Geometry starts near Target. Flip it.
                 final_geom = LineString(list(original_geom.coords)[::-1])
-                flip_count += 1
-                decision = "FLIP"
-
-            # 4. DEBUG LOGGING (First 5 examples only)
-            if i < 5:
-                logger.info(f"--- River Segment {i} ---")
-                logger.info(f"  Source Node (u): {u}")
-                logger.info(f"  Geom Start: {geom_start.coords[0]}")
-                logger.info(f"  Geom End:   {geom_end.coords[0]}")
-                logger.info(f"  Dist u->Start: {dist_u_to_start:.4f}")
-                logger.info(f"  Dist u->End:   {dist_u_to_end:.4f}")
-                logger.info(f"  Decision: {decision}")
-
-            # 5. Sanity Check for "Weird" Geometries
-            # If u is far from BOTH ends, something is wrong with the graph/geom mapping
-            if min(dist_u_to_start, dist_u_to_end) > 1.0: # 1 meter tolerance
-                weird_geometry_count += 1
-                if weird_geometry_count < 5:
-                     logger.warning(f"  [WARNING] Node u is far from both ends! Min Dist: {min(dist_u_to_start, dist_u_to_end)}")
+            
+            # CRITICAL FIX: Update the Graph object with the fixed geometry
+            # This ensures Phase 3 (Widths) grabs the correct arrow direction
+            self.DiG[u][v]['geometry'] = final_geom
 
             oriented_lines.append({
                 'geometry': final_geom,
@@ -237,25 +374,110 @@ class HydrologyAnalyzer:
                 'target_node': str(v),
                 'original_id': data.get('original_id', None)
             })
-    # FIX: Handle empty case to prevent ValueError
-        if not oriented_lines:
-            logger.error("Reconstruction failed: No oriented river segments found.")
-            # Return empty GDF with correct schema to allow pipeline to continue/fail gracefully
-            return gpd.GeoDataFrame(
-                columns=['geometry', 'source_node', 'target_node', 'original_id'], 
-                crs=self.raw_rivers.crs
-            )
-
-        
-        result_gdf = gpd.GeoDataFrame(oriented_lines, crs=self.raw_rivers.crs)
-        
-        logger.info(f"Reconstruction Stats:")
-        logger.info(f"  Kept Original Direction: {keep_count}")
-        logger.info(f"  Flipped Direction:       {flip_count}")
-        if weird_geometry_count > 0:
-            logger.warning(f"  'Floating' Segments (Node mismatch > 1m): {weird_geometry_count}")
             
-        return result_gdf
+        result = gpd.GeoDataFrame(oriented_lines, crs=self.raw_rivers.crs)
+        dropped = len(self.raw_rivers) - len(result)
+        logger.info(f"  Final Count: {len(result)}. Dropped {dropped} disconnected segments.")
+        return result
+
+
+
+    # def _propagate_flow_from_sea(self):
+    #     """
+    #     Step 3: DEBUG MODE - SINGLE ANCHOR ANALYSIS.
+    #     Only picks the first detected sea anchor and prints decision logic.
+    #     """
+    #     print("\n--- DEBUG: Analyzing First Anchor ---")
+        
+    #     self.DiG = nx.DiGraph()
+    #     self.visited = set()
+    #     queue = []
+        
+    #     # 1. Find Anchors
+    #     # We need the sea geometry union for the intersection check
+    #     sea_union = self.sea.unary_union
+    #     candidates = gpd.sjoin(self.clean_rivers, self.sea[['geometry']], how='inner', predicate='intersects')
+        
+    #     if len(candidates) == 0:
+    #         print("CRITICAL: No river segments intersect the sea!")
+    #         return
+
+    #     # 2. Pick ONLY the first candidate
+    #     first_idx = candidates.index[0]
+    #     row = candidates.loc[first_idx]
+    #     geom = row.geometry
+        
+    #     print(f"Selected Anchor Segment Index: {first_idx}")
+    #     print(f"  Geometry Start: {geom.coords[0]}")
+    #     print(f"  Geometry End:   {geom.coords[-1]}")
+        
+    #     # 3. Orient the Anchor
+    #     orientation = self._orient_anchor_segment(geom, sea_union)
+        
+    #     if orientation:
+    #         source, target = orientation # Source (Land) -> Target (Sea)
+            
+    #         # Print the logic
+    #         print(f"  Orientation Decision:")
+    #         print(f"    Land Node (Source): {source}")
+    #         print(f"    Sea Node (Target):  {target}")
+            
+    #         # Add to graph
+    #         if self.G.has_edge(source, target):
+    #             edge_data = self.G.get_edge_data(source, target)
+    #             base_data = edge_data[0] if 0 in edge_data else edge_data
+    #             self.DiG.add_edge(source, target, **base_data)
+                
+    #             self.visited.add(target)
+    #             self.visited.add(source)
+    #             queue.append(source)
+    #             print(f"  --> Anchor added. Queue seeded with Land Node.")
+    #         else:
+    #             print("  ERROR: Edge not found in base graph (Graph mismatch).")
+    #     else:
+    #         print("  ERROR: Could not determine which end is in the sea. (Ambiguous Intersection)")
+
+    #     # 4. Start Walking (Limited)
+    #     print("\n--- DEBUG: Walking Upstream (Max 10 Steps) ---")
+    #     self._run_upstream_bfs_debug(queue, max_steps=10)
+
+
+    # def _run_upstream_bfs_debug(self, queue, max_steps=10):
+    #     """
+    #     Debug version of BFS. Prints step-by-step traversal.
+    #     """
+    #     steps = 0
+        
+    #     while queue:
+    #         if steps >= max_steps:
+    #             print(f"  [Limit Reached] Stopped after {steps} segments.")
+    #             break
+                
+    #         curr = queue.pop(0) # 'curr' is the Downstream Node
+            
+    #         neighbors = list(self.G.neighbors(curr))
+    #         valid_upstream = [n for n in neighbors if n not in self.visited]
+            
+    #         print(f"  Step {steps + 1}: At Node {curr}")
+    #         print(f"    Found {len(neighbors)} neighbors. {len(valid_upstream)} are upstream.")
+            
+    #         for nbr in valid_upstream:
+    #             # Logic: Flow is Nbr -> Curr
+    #             edge_data = self.G.get_edge_data(nbr, curr)
+    #             base_data = edge_data[0] if 0 in edge_data else edge_data
+    #             self.DiG.add_edge(nbr, curr, **base_data)
+                
+    #             self.visited.add(nbr)
+                
+    #             print(f"    -> Link Added: {nbr} (Up) -> {curr} (Down)")
+                
+    #             # Single branch logic (as requested previously)
+    #             queue.append(nbr)
+    #             steps += 1
+    #             break # Force single branch
+
+
+
 
 
 
@@ -361,7 +583,7 @@ def validate_topology_continuity(gdf):
         print(f"FAILURE: Found {errors} breaks in flow direction.")
 
 # Run it
-validate_topology_continuity(rivers_with_width)
+# validate_topology_continuity(rivers_with_width)
 
 
 
@@ -753,6 +975,201 @@ def save_hydro_network(gdf: gpd.GeoDataFrame, output_path: str):
     # Save to file
     save_gdf.to_file(output_path, driver="GPKG")
     print("Save complete.")
+
+
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+@dataclass
+class NoiseRule:
+    """
+    Defines a specific layer of noise to be added to the terrain.
+    """
+    seed: int
+    multiplier: float           # The vertical scale of the noise (e.g., 400.0)
+    scale_frequency: float      # The horizontal frequency (e.g., 100.0)
+    min_elevation: float = -99999.0 # Apply only above this altitude (from Base DEM)
+    mask_layer: str = None      # Optional: Name of a mask (e.g., 'north') to restrict application
+
+def vector_to_mask(vector_gdf: gpd.GeoDataFrame, reference_profile: Dict) -> np.ndarray:
+    """
+    Converts a Vector GeoDataFrame into a boolean Numpy Array (Mask) 
+    that perfectly aligns with the reference raster profile.
+
+    Logic:
+    1. Extracts geometries from the GDF.
+    2. Uses rasterio.features.rasterize to burn them into a grid.
+    3. The grid dimensions and transform are taken from 'reference_profile'.
+
+    Args:
+        vector_gdf: Polygons to rasterize (e.g., Sea, Lakes).
+        reference_profile: The rasterio profile of the Base DEM.
+
+    Returns:
+        np.ndarray: A boolean array (True = Inside Vector, False = Outside).
+    """
+    if vector_gdf is None or vector_gdf.empty:
+        logger.warning("Empty vector layer provided for mask generation. Returning blank mask.")
+        return np.zeros((reference_profile['height'], reference_profile['width']), dtype=bool)
+
+    logger.info(f"Rasterizing {len(vector_gdf)} vector features into mask...")
+    
+    # Extract dimensions and transform from the profile
+    height = reference_profile['height']
+    width = reference_profile['width']
+    transform = reference_profile['transform']
+    
+    # Rasterize
+    # shapes expects list of (geometry, value) tuples
+    # We burn '1' where the polygon exists
+    shapes = ((geom, 1) for geom in vector_gdf.geometry)
+    
+    mask = features.rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,      # Background value
+        dtype=rasterio.uint8
+    )
+    
+    # Convert to Boolean
+    return mask.astype(bool)
+
+
+
+
+def flatten_by_mask(dem_array: np.ndarray, mask_array: np.ndarray, value: float = 0.0) -> np.ndarray:
+    """
+    Sets all pixels in the DEM that fall inside the mask to a specific constant value.
+    Used for: Flattening the Sea.
+    
+    Args:
+        dem_array: The terrain heightmap.
+        mask_array: Boolean mask (True = Flatten this area).
+        value: The height to set (default 0.0 for sea).
+        
+    Returns:
+        np.ndarray: The modified DEM.
+    """
+    logger.info(f"Flattening masked area to elevation {value}...")
+    
+    # Work on a copy to avoid mutating the original input unexpectedly
+    modified_dem = dem_array.copy()
+    
+    # Vectorized assignment (extremely fast)
+    modified_dem[mask_array] = value
+    
+    return modified_dem
+
+
+
+def flatten_lakes_smart(dem_array: np.ndarray, lakes_mask: np.ndarray) -> np.ndarray:
+    """
+    Flattens lakes to the elevation of their lowest neighbor.
+    
+    CRITICAL LOGIC:
+    We cannot flatten all lakes to the SAME value. A mountain lake is higher than a valley lake.
+    
+    Algorithm:
+    1. Use scipy.ndimage.label to identify distinct lake clusters (islands) in the mask.
+    2. Iterate through each unique lake:
+       a. Dilate the lake shape by 1 pixel to find the "Shoreline".
+       b. Extract DEM values from the Shoreline pixels.
+       c. Find the Minimum value of the Shoreline.
+       d. Set the Lake pixels to that Minimum value.
+       
+    Args:
+        dem_array: The terrain heightmap.
+        lakes_mask: Boolean mask of all lakes.
+        
+    Returns:
+        np.ndarray: The DEM with flattened lakes.
+    """
+    logger.info("Smart-flattening lakes to local shoreline elevation...")
+    
+    modified_dem = dem_array.copy()
+    
+    # 1. Identify distinct lakes
+    # 'labeled_array' has a unique int ID for every separate lake blob
+    # 'num_features' is the total count
+    labeled_array, num_features = ndimage.label(lakes_mask)
+    
+    logger.info(f"  Found {num_features} distinct lakes.")
+    
+    # Structure for dilation (3x3 square connectivity)
+    # This defines what "neighbor" means
+    struct = ndimage.generate_binary_structure(2, 2)
+    
+    # 2. Iterate through lakes
+    # We start at 1 because 0 is the background
+    for lake_id in range(1, num_features + 1):
+        
+        # Create a boolean mask for JUST this specific lake
+        # Note: For massive maps with 10k lakes, this can be optimized with bounding boxes,
+        # but for typical Empire maps, this is fast enough.
+        this_lake_mask = (labeled_array == lake_id)
+        
+        # Dilate to find the shoreline
+        # binary_dilation expands the True area by 1 pixel in all directions
+        dilated = ndimage.binary_dilation(this_lake_mask, structure=struct)
+        
+        # The Shoreline is the Dilated area MINUS the Lake itself
+        # This gives us the ring of pixels touching the lake
+        shoreline_mask = dilated & ~this_lake_mask
+        
+        # Edge Case: If lake covers the whole map (no shoreline), skip
+        if not np.any(shoreline_mask):
+            continue
+            
+        # Get the terrain heights at the shoreline
+        shore_heights = modified_dem[shoreline_mask]
+        
+        if shore_heights.size > 0:
+            # Find the lowest point on the shore (the drain point)
+            water_level = np.min(shore_heights)
+            
+            # Flatten the lake to this level
+            modified_dem[this_lake_mask] = water_level
+            
+    return modified_dem
+
+
+
+def apply_noise_rules(base_dem: np.ndarray, 
+                      profile: Dict, 
+                      rules: List[NoiseRule], 
+                      mask_library: Dict[str, np.ndarray] = {}) -> np.ndarray:
+    """
+    The Master Compositor. Stacks multiple noise layers onto the base DEM 
+    based on elevation thresholds and spatial masks.
+
+    Algorithm:
+    1. Start with a copy of Base DEM.
+    2. Iterate through 'rules':
+       a. Generate a noise array in-memory using the rule's Seed and Scale.
+       b. Scale the noise: noise = noise * rule.multiplier.
+       c. Create a 'Application Mask' (Boolean):
+          - Initialize True.
+          - IF rule.min_elevation is set: AND with (Base_DEM >= min_elevation).
+          - IF rule.mask_layer is set: AND with (mask_library[rule.mask_layer]).
+       d. Add noise: Final_DEM += (Noise * Application_Mask).
+    
+    Args:
+        base_dem: The starting topography (NumPy array).
+        profile: Rasterio profile (needed for noise generation dimensions).
+        rules: List of NoiseRule objects defining the layers.
+        mask_library: Dictionary mapping names ('north', 'sea') to Numpy Boolean Arrays.
+        
+    Returns:
+        np.ndarray: The final composite terrain.
+    """
+    pass
+
+
+
+
 
 
 
