@@ -1,0 +1,450 @@
+import geopandas as gpd
+import logging
+
+import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib import cm
+import momepy
+
+import networkx as nx
+import numpy as np
+
+import shapely
+from shapely.geometry import Point, LineString
+
+from tqdm import tqdm
+
+
+# Ensure we have a logger
+logger = logging.getLogger(__name__)
+from .logger import setup_logger
+setup_logger(log_name="wfrp_phys_geo")
+
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+
+class HydrologyAnalyzer:
+    """
+    A stateful engine that converts a raw, undirected river network into a 
+    hydrologically oriented Directed Acyclic Graph (DAG).
+    """
+    
+    def __init__(self, river_gdf: gpd.GeoDataFrame, sea_gdf: gpd.GeoDataFrame, lake_gdf: gpd.GeoDataFrame = None):
+        self.raw_rivers = river_gdf
+        self.sea = sea_gdf
+        self.lakes = lake_gdf
+        
+        # Internal State
+        self.G = None       # The undirected base graph
+        self.DiG = None     # The directed result graph
+        self.sinks = set()  # Set of nodes that drain to sea
+        
+    def run(self) -> gpd.GeoDataFrame:
+        """
+        Orchestrates the analysis pipeline.
+        """
+        logger.info("--- Phase 1: Hydrological Orientation (Class-Based) ---")
+        
+        self._build_base_topology()
+        
+        if self.lakes is not None:
+            self._add_virtual_lake_connections()
+            
+        self._identify_sea_sinks()
+        self._orient_network_bfs()
+        
+        return self._reconstruct_geodataframe()
+
+    def _build_base_topology(self):
+        """Step 1: Convert LineStrings to an undirected NetworkX graph."""
+        logger.info("Building base topology...")
+        # Explode to ensure simple lines
+        self.exploded_rivers = self.raw_rivers.explode(index_parts=False).reset_index(drop=True)
+        # Primal approach: Nodes = Junctions, Edges = Rivers
+        self.G = momepy.gdf_to_nx(self.exploded_rivers, approach='primal')
+
+    def _add_virtual_lake_connections(self):
+        """Step 2: Bridge gaps by connecting river mouths/sources to lake centers."""
+        logger.info("Integrating canonical lakes...")
+        
+        # Get graph nodes as geometry
+        node_points = [Point(n) for n in self.G.nodes]
+        node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.raw_rivers.crs)
+        
+        # Spatial Join: Find nodes touching lakes
+        lake_nodes = gpd.sjoin(node_gdf, self.lakes, how='inner', predicate='intersects')
+        
+        count = 0
+        for lake_idx, group in lake_nodes.groupby('index_right'):
+            # Create Virtual Node at Lake Centroid
+            lake_geom = self.lakes.geometry.iloc[lake_idx]
+            virtual_node = (lake_geom.centroid.x, lake_geom.centroid.y)
+            
+            self.G.add_node(virtual_node, type='virtual_lake')
+            
+            # Connect real nodes to virtual node with 0 weight
+            for real_node in group.node_id:
+                self.G.add_edge(real_node, virtual_node, weight=0, type='virtual_connection')
+                self.G.add_edge(virtual_node, real_node, weight=0, type='virtual_connection')
+                count += 1
+                
+        logger.info(f"Added {count} connections to virtual lake nodes.")
+
+    def _identify_sea_sinks(self):
+        """Step 3: Find nodes that touch the sea polygon."""
+        logger.info("Identifying discharge points...")
+        
+        node_points = [Point(n) for n in self.G.nodes]
+        node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.sea.crs)
+        
+        # Spatial Join
+        matches = gpd.sjoin(node_gdf, self.sea, how='inner', predicate='intersects')
+        self.sinks = set(matches.node_id.tolist())
+        
+        if not self.sinks:
+            logger.warning("No river mouths found touching the sea! Check your CRS or sea polygon.")
+        else:
+            logger.info(f"Found {len(self.sinks)} river mouths.")
+
+    def _orient_network_bfs(self):
+        """Step 4: Reverse BFS from Sea Sinks to orient flow direction."""
+        logger.info("Orienting flow direction (Sea -> Source)...")
+        
+        self.DiG = nx.DiGraph()
+        queue = list(self.sinks)
+        visited = set(self.sinks)
+        
+        # Progress bar
+        pbar = tqdm(total=len(self.G.nodes), desc="Orienting")
+        
+        while queue:
+            current_node = queue.pop(0)
+            pbar.update(1)
+            
+            # Look at neighbors in the Undirected Graph
+            neighbors = list(self.G.neighbors(current_node))
+            
+            for nbr in neighbors:
+                if nbr not in visited:
+                    # If we are at 'current' and found 'nbr', then flow is Nbr -> Current
+                    
+                    # Handle Momepy MultiGraph structure (get first edge key)
+                    edge_data = self.G.get_edge_data(nbr, current_node)
+                    base_data = edge_data[0] if 0 in edge_data else edge_data
+                    
+                    # Check if this is a virtual lake connection
+                    is_virtual = (self.G.nodes[current_node].get('type') == 'virtual_lake') or \
+                                 (self.G.nodes[nbr].get('type') == 'virtual_lake')
+                    
+                    # We only add REAL rivers to the final directed graph
+                    if not is_virtual:
+                        self.DiG.add_edge(nbr, current_node, **base_data)
+                    
+                    # We traverse everything (including lakes) to find upstream sources
+                    visited.add(nbr)
+                    queue.append(nbr)
+        
+        pbar.close()
+
+    def _reconstruct_geodataframe(self) -> gpd.GeoDataFrame:
+        """Step 5: Convert DiGraph back to GeoDataFrame and fix LineString direction."""
+        logger.info("Reconstructing geometry...")
+        
+        oriented_lines = []
+        
+        for u, v, data in self.DiG.edges(data=True):
+            original_geom = data.get('geometry')
+            
+            if original_geom is None:
+                continue
+
+            # Geometry Validation:
+            # We want the LineString to physically start at u and end at v
+            start_pt = Point(original_geom.coords[0])
+            
+            # Check distance to 'u' (Source). 
+            # If distance is near zero, the line is already correct.
+            # If not, it's backwards.
+            if start_pt.distance(Point(u)) < 1e-6:
+                final_geom = original_geom
+            else:
+                final_geom = LineString(list(original_geom.coords)[::-1])
+                
+            oriented_lines.append({
+                'geometry': final_geom,
+                'source_node': u,
+                'target_node': v,
+                # Copy over any other attributes from original data
+                'original_id': data.get('original_id', None) 
+            })
+            
+        result_gdf = gpd.GeoDataFrame(oriented_lines, crs=self.raw_rivers.crs)
+        
+        dropped = len(self.exploded_rivers) - len(result_gdf)
+        logger.info(f"Reconstruction complete. Valid segments: {len(result_gdf)}. Dropped (Disconnected): {dropped}")
+        
+        return result_gdf
+
+
+
+def plot_flow(oriented_gdf, sea_gdf, lake_gdf=None):
+    """
+    Visualizes the river network with flow direction arrows.
+    Fixed to prevent 'Red Blob' and Legend warnings.
+    """
+    fig, ax = plt.subplots(figsize=(12, 12))
+    
+    # 1. Plot Base Layers
+    sea_gdf.plot(ax=ax, color='#e0f7fa', edgecolor='none', zorder=1)
+    if lake_gdf is not None:
+        lake_gdf.plot(ax=ax, color='#81d4fa', edgecolor='none', zorder=2)
+        
+    # 2. Plot River Lines (Black background lines)
+    oriented_gdf.plot(ax=ax, color='black', linewidth=0.8, alpha=0.5, zorder=3)
+    
+    # 3. Calculate Arrows
+    # Get start and end points
+    coords = oriented_gdf.geometry.apply(lambda geom: (geom.centroid.x, geom.centroid.y, 
+                                                       geom.coords[-1][0] - geom.coords[0][0], 
+                                                       geom.coords[-1][1] - geom.coords[0][1]))
+    X, Y, U, V = zip(*coords)
+    X, Y, U, V = np.array(X), np.array(Y), np.array(U), np.array(V)
+    
+    # CRITICAL FIX: Normalize U, V to unit vectors
+    # This ensures a 5km long river and a 500m river get the same size arrow
+    norm = np.sqrt(U**2 + V**2)
+    
+    # Avoid division by zero
+    mask = norm > 0
+    X, Y = X[mask], Y[mask]
+    U, V = U[mask] / norm[mask], V[mask] / norm[mask]
+    
+    # 4. Quiver Plot (The Arrows)
+    # scale=30 means "30 data units per arrow unit". Adjust if still too big/small.
+    # width=0.002 makes the shaft thin.
+    ax.quiver(X[::10], Y[::10], U[::10], V[::10], 
+              color='red', 
+              zorder=4,
+              pivot='mid',      # Center arrow on the river segment
+              units='inches',   # Define size relative to the plot window, not map coordinates
+              scale=10,         # Higher number = Shorter arrows (Counter-intuitive!)
+              width=0.005,      # Thin shaft
+              headwidth=5,      # Proportional head
+              headlength=5,
+              alpha=0.8)
+    
+    # 5. Manual Legend (Fixes the warnings)
+    sea_patch = mpatches.Patch(color='#e0f7fa', label='Sea')
+    lake_patch = mpatches.Patch(color='#81d4fa', label='Lakes')
+    river_line = mlines.Line2D([], [], color='black', linewidth=1, label='River Channel')
+    flow_arrow = mlines.Line2D([], [], color='red', marker='>', linestyle='None',
+                              markersize=10, label='Flow Direction')
+    
+    handles = [sea_patch, river_line, flow_arrow]
+    if lake_gdf is not None:
+        handles.insert(1, lake_patch)
+        
+    ax.legend(handles=handles, loc='upper right')
+    
+    plt.title("Hydrologically Oriented River Network")
+    plt.axis('equal') # Ensure map isn't stretched
+    plt.show()
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+class CalculateFlowMagnitude:
+    """
+    A processing engine that calculates hydrological statistics 
+    (Flow Accumulation and Strahler Stream Order) for a river DAG.
+    """
+
+    def __init__(self, graph: nx.DiGraph):
+        # We work on a copy to avoid mutating the original graph unexpectedly
+        # though usually in pipelines modifying in place is acceptable.
+        self.graph = graph
+
+    def run(self) -> nx.DiGraph:
+        """
+        Orchestrates the flow calculation pipeline.
+        """
+        logger.info("--- Phase 2: Flow Accumulation (Class-Based) ---")
+
+        self._break_cycles()
+        self._initialize_attributes()
+        
+        # Get execution order
+        topo_order = self._get_topological_order()
+        
+        if topo_order:
+            self._propagate_flow(topo_order)
+            self._map_attributes_to_edges()
+        else:
+            logger.error("Skipping flow calculation due to topological errors.")
+
+        return self.graph
+
+    def _break_cycles(self):
+        """Step 1: Detect and break cycles to enforce DAG structure."""
+        if not nx.is_directed_acyclic_graph(self.graph):
+            logger.warning("Graph contains cycles! Attempting to break them...")
+            
+            # Find cycles (returns a generator of lists)
+            cycles = list(nx.simple_cycles(self.graph))
+            logger.info(f"Found {len(cycles)} cycles.")
+            
+            count = 0
+            for cycle in cycles:
+                # Remove the edge returning to the start of the cycle (u -> v)
+                # Cycle is [u, v, w, u] represented as nodes [u, v, w]
+                u, v = cycle[-1], cycle[0]
+                
+                if self.graph.has_edge(u, v):
+                    self.graph.remove_edge(u, v)
+                    count += 1
+            
+            logger.info(f"Broke {count} cyclic edges.")
+        else:
+            logger.info("Graph is acyclic (DAG). No repairs needed.")
+
+    def _initialize_attributes(self):
+        """Step 2: Set baseline values for accumulation and order."""
+        # flow_acc: Total number of upstream segments + 1 (itself)
+        nx.set_node_attributes(self.graph, 1, 'flow_acc')
+        # strahler: Stream order (1 = Headwater)
+        nx.set_node_attributes(self.graph, 1, 'strahler')
+
+    def _get_topological_order(self) -> list:
+        """Step 3: Sort nodes from Headwaters -> Sea."""
+        try:
+            topo_order = list(nx.topological_sort(self.graph))
+            logger.info(f"Topological sort successful. Processing {len(topo_order)} nodes.")
+            return topo_order
+        except nx.NetworkXUnfeasible:
+            logger.critical("Graph still has cycles after repair attempt. Cannot compute flow.")
+            return []
+
+    def _propagate_flow(self, topo_order: list):
+        """Step 4: Iterate downstream to sum accumulation and calculate hierarchy."""
+        for node in topo_order:
+            # Get upstream neighbors (predecessors)
+            predecessors = list(self.graph.predecessors(node))
+            
+            if not predecessors:
+                continue # It's a source, keep default values (1, 1)
+                
+            # --- A. Flow Accumulation (Simple Sum) ---
+            incoming_flow = sum(self.graph.nodes[pred]['flow_acc'] for pred in predecessors)
+            self.graph.nodes[node]['flow_acc'] += incoming_flow
+            
+            # --- B. Strahler Order (Hierarchical) ---
+            incoming_strahlers = [self.graph.nodes[pred]['strahler'] for pred in predecessors]
+            
+            if incoming_strahlers:
+                max_s = max(incoming_strahlers)
+                # Strahler Rule: If two streams of max order join, order increments.
+                # Otherwise, it stays the same.
+                if incoming_strahlers.count(max_s) >= 2:
+                    self.graph.nodes[node]['strahler'] = max_s + 1
+                else:
+                    self.graph.nodes[node]['strahler'] = max_s
+
+    def _map_attributes_to_edges(self):
+        """Step 5: Write node calculations to outgoing edges for vector mapping."""
+        # Iterate over (u, v) pairs.
+        # Since DiGraph is simple, we don't need 'keys=True'
+        for u, v in self.graph.edges():
+            # The properties of the edge u->v are defined by the accumulation at u
+            flow_val = self.graph.nodes[u]['flow_acc']
+            strahler_val = self.graph.nodes[u]['strahler']
+            
+            self.graph[u][v]['magnitude'] = flow_val
+            self.graph[u][v]['strahler'] = strahler_val
+            
+        logger.info("Flow attributes mapped to edges.")
+
+
+
+# --- VISUALIZER ---
+
+def plot_river_hierarchy(DiG, sea_gdf, lake_gdf=None):
+    """
+    Visualizes the river network with line thickness based on Magnitude
+    and color based on Strahler Order.
+    """
+    fig, ax = plt.subplots(figsize=(15, 15), facecolor='white')
+    
+    # 1. Context Layers
+    sea_gdf.plot(ax=ax, color='#e0f7fa', edgecolor='none', zorder=1)
+    if lake_gdf is not None:
+        lake_gdf.plot(ax=ax, color='#81d4fa', edgecolor='none', zorder=2)
+        
+    # 2. Extract Edge Data for Plotting
+    lines = []
+    strahlers = []
+    magnitudes = []
+    
+    for u, v, data in DiG.edges(data=True):
+        if 'geometry' in data:
+            lines.append(data['geometry'])
+            # Default to 1 if missing
+            strahlers.append(data.get('strahler', 1))
+            magnitudes.append(data.get('magnitude', 1))
+            
+    if not lines:
+        print("No river edges to plot!")
+        return
+
+    # 3. Create GeoDataFrame for Plotting
+    # We use a temporary GDF to leverage matplotlib plotting
+    plot_gdf = gpd.GeoDataFrame({
+        'geometry': lines, 
+        'strahler': strahlers,
+        'magnitude': magnitudes
+    }, crs=sea_gdf.crs)
+    
+    # 4. Dynamic Styling
+    # Width: Logarithmic scaling so the Reik doesn't cover the whole map
+    # We add 0.5 base width so source streams are visible
+    linewidths = (np.log(plot_gdf['magnitude']) * 0.8) + 0.5
+    
+    # Color: Colormap based on Strahler Order
+    # Low Order = Blue/Purple, High Order = Yellow/Red
+    cmap = cm.get_cmap('plasma') 
+    norm = Normalize(vmin=plot_gdf['strahler'].min(), vmax=plot_gdf['strahler'].max())
+    
+    # 5. Plot
+    # We pass the calculated linewidths directly
+    plot_gdf.plot(ax=ax, 
+                  column='strahler', 
+                  cmap=cmap, 
+                  linewidth=linewidths,
+                  zorder=3,
+                  legend=True,
+                  legend_kwds={'label': "Strahler Stream Order", 'shrink': 0.5})
+    
+    plt.title(f"River Network Hierarchy\n(Thickness = Flow Magnitude, Color = Stream Order)")
+    plt.axis('equal')
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
