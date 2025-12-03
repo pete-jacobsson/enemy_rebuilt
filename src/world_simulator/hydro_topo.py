@@ -96,20 +96,43 @@ class HydrologyAnalyzer:
         logger.info(f"Added {count} connections to virtual lake nodes.")
 
     def _identify_sea_sinks(self):
-        """Step 3: Find nodes that touch the sea polygon."""
+        """
+        Step 3: Find nodes that touch the sea polygon.
+        FIX: Tries Strict Mode (Degree 1) first. If 0 found, falls back to Loose Mode.
+        """
         logger.info("Identifying discharge points...")
         
         node_points = [Point(n) for n in self.G.nodes]
         node_gdf = gpd.GeoDataFrame({'node_id': list(self.G.nodes)}, geometry=node_points, crs=self.sea.crs)
         
-        # Spatial Join
+        # 1. Broad Phase: Find ALL nodes touching the sea
         matches = gpd.sjoin(node_gdf, self.sea, how='inner', predicate='intersects')
-        self.sinks = set(matches.node_id.tolist())
+        candidate_sinks = set(matches.node_id.tolist())
         
-        if not self.sinks:
-            logger.warning("No river mouths found touching the sea! Check your CRS or sea polygon.")
+        logger.info(f"  Nodes touching sea: {len(candidate_sinks)}")
+        
+        if not candidate_sinks:
+            logger.warning("CRITICAL: No river nodes intersect the sea polygon!")
+            self.sinks = set()
+            return
+
+        # 2. Strict Phase: Degree Filter (Prefer Dead Ends)
+        valid_sinks = set()
+        
+        for node in candidate_sinks:
+            # Check degree in undirected graph
+            degree = self.G.degree(node)
+            if degree == 1:
+                valid_sinks.add(node)
+                
+        # 3. Fallback Logic
+        if len(valid_sinks) > 0:
+            self.sinks = valid_sinks
+            logger.info(f"  Strict Mode: Using {len(self.sinks)} Degree-1 sinks.")
         else:
-            logger.info(f"Found {len(self.sinks)} river mouths.")
+            # Fallback to everyone if strict mode failed
+            self.sinks = candidate_sinks
+            logger.warning(f"  Strict Mode failed (0 sinks). Falling back to {len(self.sinks)} coastal intersections.")
 
     def _orient_network_bfs(self):
         """Step 4: Reverse BFS from Sea Sinks to orient flow direction."""
@@ -214,7 +237,16 @@ class HydrologyAnalyzer:
                 'target_node': str(v),
                 'original_id': data.get('original_id', None)
             })
-            
+    # FIX: Handle empty case to prevent ValueError
+        if not oriented_lines:
+            logger.error("Reconstruction failed: No oriented river segments found.")
+            # Return empty GDF with correct schema to allow pipeline to continue/fail gracefully
+            return gpd.GeoDataFrame(
+                columns=['geometry', 'source_node', 'target_node', 'original_id'], 
+                crs=self.raw_rivers.crs
+            )
+
+        
         result_gdf = gpd.GeoDataFrame(oriented_lines, crs=self.raw_rivers.crs)
         
         logger.info(f"Reconstruction Stats:")
@@ -631,8 +663,8 @@ def assign_river_widths(G: nx.DiGraph,
         # 4. Store Data
         river_segments.append({
             'geometry': data['geometry'],
-            'source': u,
-            'target': v,
+            'source_node': str(u),
+            'target_node': str(v),
             'magnitude': mag,
             'strahler': data.get('strahler', 1),
             'width': final_width
@@ -713,10 +745,10 @@ def save_hydro_network(gdf: gpd.GeoDataFrame, output_path: str):
     # GPKG attribute tables only accept String, Int, Float.
     # We convert source/target columns to string representation.
     if 'source' in save_gdf.columns:
-        save_gdf['source'] = save_gdf['source'].astype(str)
+        save_gdf['source_node'] = save_gdf['source_node'].astype(str)
     
     if 'target' in save_gdf.columns:
-        save_gdf['target'] = save_gdf['target'].astype(str)
+        save_gdf['target_node'] = save_gdf['target_node'].astype(str)
         
     # Save to file
     save_gdf.to_file(output_path, driver="GPKG")
