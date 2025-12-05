@@ -16,13 +16,17 @@ from rasterio import features
 import networkx as nx
 import numpy as np
 import pandas as pd
+import rasterio
 
 from scipy import ndimage
+from scipy.ndimage import zoom
 import shapely
 from shapely.geometry import Point, LineString
 
 from tqdm import tqdm
 from typing import List, Optional, Union, Dict, Any
+
+
 
 
 # Ensure we have a logger
@@ -130,6 +134,143 @@ def flatten_lakes_smart(dem_array: np.ndarray, lakes_mask: np.ndarray) -> np.nda
 
 
 
+
+logger = logging.getLogger(__name__)
+
+class CoastalTaper:
+    """
+    Applies a smooth elevation taper (attenuation) near the coastline.
+    
+    The goal is to fix the 'Cliffs of Dover' problem where land meets sea at 
+    an abrupt 200m cliff. This tool creates a gradient that forces the 
+    terrain to 0m at the coast and smoothly ramps up to full height inland.
+    
+    Optimizations:
+    1. Downscaling: Calculates heavy gradients at low resolution.
+    2. Float16: Uses half-precision floats for the mask to save ~300MB RAM.
+    """
+    
+    def __init__(self, sea_mask: np.ndarray, taper_distance_px: float):
+        """
+        Args:
+            sea_mask: Boolean mask (True = Sea).
+            taper_distance_px: Distance in pixels over which the land fades in.
+        """
+        self.sea_mask = sea_mask
+        self.taper_dist = taper_distance_px
+        self.taper_map = None
+
+    def generate_taper_map(self, power: float = 2.0, downsample_factor: float = 0.1) -> np.ndarray:
+        """
+        Orchestrator: Generates the attenuation map using low-res approximation.
+        
+        Args:
+            power: Curve steepness (1.0 = Linear, 2.0 = Quadratic).
+            downsample_factor: Resolution scale (0.1 = 10%).
+            
+        Returns:
+            np.ndarray: float16 map (0.0 at coast, 1.0 inland).
+        """
+        logger.info(f"Generating Coastal Taper (Dist={self.taper_dist}px, Power={power})...")
+        
+        # 1. Create low-res working canvas
+        small_mask = self._downscale_mask(self.sea_mask, downsample_factor)
+        
+        # 2. Calculate distance field on the small mask
+        # Adjust the target distance to match the new scale
+        scaled_dist = self.taper_dist * downsample_factor
+        small_gradient = self._calculate_gradient_field(small_mask, scaled_dist, power)
+        
+        # 3. Upscale back to full resolution
+        full_shape = self.sea_mask.shape
+        self.taper_map = self._upscale_to_target(small_gradient, full_shape)
+        
+        return self.taper_map
+
+    def apply(self, dem: np.ndarray) -> np.ndarray:
+        """
+        Multiplies the DEM by the generated taper map.
+        """
+        if self.taper_map is None:
+            raise ValueError("Run generate_taper_map() first.")
+            
+        logger.info("Applying Coastal Taper to DEM...")
+        
+        # Convert Taper to DEM type (usually float32/64) just for the multiplication
+        # to avoid NumPy type errors, or rely on broadcasting.
+        # In-place multiplication if possible to save RAM.
+        return dem * self.taper_map.astype(dem.dtype)
+
+    def _downscale_mask(self, mask: np.ndarray, factor: float) -> np.ndarray:
+        """Helper: shrinks the boolean mask."""
+        if factor >= 1.0:
+            return mask
+        
+        logger.debug(f"  Downscaling mask by factor {factor}...")
+        # Order 0 = Nearest Neighbor (keeps it boolean/integer)
+        return zoom(mask, factor, order=0)
+
+    def _calculate_gradient_field(self, mask: np.ndarray, max_dist: float, power: float) -> np.ndarray:
+        """
+        Helper: Calculates normalized distance field on a (potentially small) array.
+        Returns float16 to save memory.
+        """
+        logger.debug("  Calculating Distance Transform...")
+        
+        # Calculate distance to nearest "False" (Land pixels look for Sea)
+        # Invert mask: True=Sea. We want distance FROM Sea (0 at sea).
+        # edt calculates distance to background (0). So we want Sea to be 0.
+        # Input to edt should be LAND (True) and SEA (False/0).
+        # Our self.sea_mask is True=Sea. So we pass ~mask (True=Land).
+        dist_field = ndimage.distance_transform_edt(~mask)
+        
+        # Normalize to 0.0 - 1.0
+        # We calculate in float32 for precision, then cast to float16
+        gradient = np.clip(dist_field / max_dist, 0.0, 1.0)
+        
+        # Apply Curve
+        if power != 1.0:
+            gradient = np.power(gradient, power)
+            
+        return gradient.astype(np.float16)
+
+    def _upscale_to_target(self, low_res_map: np.ndarray, target_shape: tuple) -> np.ndarray:
+        """
+        Helper: Resizes the low-res gradient back to full dimensions.
+        """
+        current_shape = low_res_map.shape
+        if current_shape == target_shape:
+            return low_res_map
+            
+        logger.debug(f"  Upscaling result to {target_shape}...")
+        
+        # Calculate exact zoom factors
+        zoom_y = target_shape[0] / current_shape[0]
+        zoom_x = target_shape[1] / current_shape[1]
+        
+        # CRITICAL FIX: Scipy zoom crashes on float16. 
+        # We must promote to float32 for the calculation.
+        input_array = low_res_map.astype(np.float32)
+        
+        # Order 1 = Bilinear Interpolation
+        upscaled = zoom(input_array, (zoom_y, zoom_x), order=1)
+        
+        # Safety: Zoom can sometimes be off by +/- 1 pixel due to rounding
+        if upscaled.shape != target_shape:
+            h, w = target_shape
+            # If bigger, crop
+            if upscaled.shape[0] >= h and upscaled.shape[1] >= w:
+                upscaled = upscaled[:h, :w]
+            else:
+                # If smaller (rare), pad with edge values
+                # This is a robust fallback
+                from numpy import pad
+                diff_h = h - upscaled.shape[0]
+                diff_w = w - upscaled.shape[1]
+                upscaled = np.pad(upscaled, ((0, max(0, diff_h)), (0, max(0, diff_w))), mode='edge')
+
+        # Cast back to float16 to save RAM
+        return upscaled.astype(np.float16)
 
 
 
