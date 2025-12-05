@@ -3,6 +3,7 @@ import rasterio
 from rasterio import features
 import geopandas as gpd
 from scipy import ndimage
+from scipy.ndimage import gaussian_filter
 import noise
 import pyfastnoisesimd as fns
 from tqdm import tqdm
@@ -23,7 +24,45 @@ if not hasattr(np, 'product'):
     np.product = np.prod
 # -------------------------------------
 
+# ==========================================
+#        PARALLEL WORKER FUNCTIONS
+# (Must be at top level for Joblib pickling)
+# ==========================================
 
+def _process_sdf_task(mask_tile: np.ndarray, pad_top: int, pad_left: int, core_height: int, core_width: int) -> np.ndarray:
+    """
+    Internal worker to calculate SDF on a padded tile and extract the core result.
+    """
+    # Calculate the EDT on the padded tile
+    dist_outside = ndimage.distance_transform_edt(~mask_tile)
+    dist_inside = ndimage.distance_transform_edt(mask_tile)
+    sdf = dist_outside - dist_inside
+    
+    # Extract the un-padded core result
+    y_start = pad_top
+    y_end = pad_top + core_height
+    x_start = pad_left
+    x_end = pad_left + core_width
+    
+    return sdf[y_start:y_end, x_start:x_end]
+
+
+def _process_blur_task(mask_tile: np.ndarray, sigma: float, pad_top: int, pad_left: int, core_height: int, core_width: int) -> np.ndarray:
+    """Worker to apply Gaussian Blur to a tile."""
+    float_tile = mask_tile.astype(np.float32)
+    blurred = gaussian_filter(float_tile, sigma=sigma)
+    
+    y_start = pad_top
+    y_end = pad_top + core_height
+    x_start = pad_left
+    x_end = pad_left + core_width
+    
+    return (blurred[y_start:y_end, x_start:x_end] > 0.5)
+
+
+# ==========================================
+#             HELPER FUNCTIONS
+# ==========================================
 def vector_to_mask(vector_gdf: gpd.GeoDataFrame, reference_profile: Dict) -> np.ndarray:
     """
     Converts a Vector GeoDataFrame into a boolean Numpy Array (Mask) 
@@ -70,7 +109,8 @@ def vector_to_mask(vector_gdf: gpd.GeoDataFrame, reference_profile: Dict) -> np.
 
 
 def _generate_noise_in_memory(shape: tuple, scale: float, seed: int, 
-                              octaves: int, persistence: float, lacunarity: float) -> np.ndarray:
+                              octaves: int, persistence: float, lacunarity: float,
+                              fractal_type: str = 'FBM') -> np.ndarray:
     """
     High-Performance Vectorized SIMD Noise Generation.
     
@@ -123,14 +163,24 @@ def _generate_noise_in_memory(shape: tuple, scale: float, seed: int,
     simplex = fns.Noise(numWorkers = min(1, os.cpu_count() - 1))
     
     simplex.noiseType = fns.NoiseType.Perlin
-    simplex.fractal.type = fns.FractalType.FBM
-    
     simplex.seed = int(seed)
+
+    # --- FRACTAL TYPE SELECTION ---
+    if fractal_type == 'RigidMulti':
+        simplex.fractal.type = fns.FractalType.RigidMulti
+    elif fractal_type == 'Billow':
+        simplex.fractal.type = fns.FractalType.Billow
+    else:
+        simplex.fractal.type = fns.FractalType.FBM
+    # ------------------------------
+
+
     
     # CONVERSION NOTE:
     # The 'noise' library uses: noise(x / scale)
     # This library uses: noise(x * frequency)
     # Therefore: frequency = 1.0 / scale
+    if scale == 0: scale = 0.0001
     simplex.frequency = 1.0 / scale
     
     simplex.fractal.octaves = int(octaves)
@@ -165,22 +215,7 @@ def _generate_noise_in_memory(shape: tuple, scale: float, seed: int,
 
 
 
-def _process_sdf_task(mask_tile: np.ndarray, pad_top: int, pad_left: int, core_height: int, core_width: int) -> np.ndarray:
-    """
-    Internal worker to calculate SDF on a padded tile and extract the core result.
-    """
-    # Calculate the EDT on the padded tile
-    dist_outside = ndimage.distance_transform_edt(~mask_tile)
-    dist_inside = ndimage.distance_transform_edt(mask_tile)
-    sdf = dist_outside - dist_inside
-    
-    # Extract the un-padded core result
-    y_start = pad_top
-    y_end = pad_top + core_height
-    x_start = pad_left
-    x_end = pad_left + core_width
-    
-    return sdf[y_start:y_end, x_start:x_end]
+
 
 # --- SDF GENERATION HELPER ---
 
@@ -246,13 +281,77 @@ def _calculate_parallel_sdf(mask: np.ndarray, tile_size: int, buffer_size: int) 
 
 
 
+
+def _smooth_mask_parallel(mask: np.ndarray, sigma: float, tile_size: int) -> np.ndarray:
+    """
+    Orchestrates parallel Gaussian smoothing to remove 'stair-step' artifacts 
+    from low-res source vectors.
+    """
+    if sigma <= 0:
+        return mask
+
+    logger.info(f"  Pre-smoothing mask (Sigma={sigma})...")
+    
+    height, width = mask.shape
+    n_jobs = max(1, os.cpu_count() - 1)
+    
+    # Buffer needs to be approx 3x Sigma to catch the blur falloff
+    buffer_size = int(max(20, sigma * 4))
+    
+    tasks = []
+    
+    for y_start in range(0, height, tile_size):
+        for x_start in range(0, width, tile_size):
+            y_end = min(y_start + tile_size, height)
+            x_end = min(x_start + tile_size, width)
+            
+            y_pad_start = max(0, y_start - buffer_size)
+            x_pad_start = max(0, x_start - buffer_size)
+            y_pad_end = min(height, y_end + buffer_size)
+            x_pad_end = min(width, x_end + buffer_size)
+            
+            tasks.append({
+                'mask_tile': mask[y_pad_start:y_pad_end, x_pad_start:x_pad_end],
+                'y_start': y_start,
+                'x_start': x_start,
+                'y_end': y_end,
+                'x_end': x_end,
+                'core_height': y_end - y_start,
+                'core_width': x_end - x_start,
+                'pad_top': y_start - y_pad_start,
+                'pad_left': x_start - x_pad_start
+            })
+            
+    # Run Parallel Blur
+    results = Parallel(n_jobs=n_jobs, backend='loky')(
+        delayed(_process_blur_task)(
+            task['mask_tile'], 
+            sigma,
+            task['pad_top'], 
+            task['pad_left'], 
+            task['core_height'], 
+            task['core_width']
+        ) for task in tqdm(tasks, desc="Smoothing", leave=False)
+    )
+    
+    # Reconstruct
+    smoothed_map = np.zeros_like(mask)
+    
+    for result, task in zip(results, tasks):
+        smoothed_map[task['y_start']:task['y_end'], task['x_start']:task['x_end']] = result
+        
+    return smoothed_map
+
+
 def roughen_mask_edges(mask: np.ndarray, 
                        seed: int = 42, 
                        scale: float = 20.0, 
                        magnitude: float = 10.0,
                        persistence: float = 0.5,
                        lacunarity: float = 2.0,
-                       tile_size: int = 2048) -> np.ndarray:
+                       tile_size: int = 2048,
+                       fractal_type: str = 'FBM',
+                       pre_smooth: float = 0.0) -> np.ndarray:
     """
     Applies Domain Warping (Fractal Displacement) to the edges of a boolean mask.
     
@@ -282,10 +381,19 @@ def roughen_mask_edges(mask: np.ndarray,
     
     # Default buffer size for distance calculation (e.g., 25km at 125m/px)
     BUFFER_SIZE = 200 
+
+
+    # 0. PRE-SMOOTHING (The Fix for Blocky Pixels)
+    # Initialize variable first to ensure scope safety
+    working_mask = mask 
+    
+    if pre_smooth > 0:
+        working_mask = _smooth_mask_parallel(mask, pre_smooth, tile_size)
+
     
     # 1. CALCULATE SDF (Parallelized)
     # The new function handles the tiling and reconstruction
-    sdf_map = _calculate_parallel_sdf(mask, tile_size, BUFFER_SIZE)
+    sdf_map = _calculate_parallel_sdf(working_mask, tile_size, BUFFER_SIZE)
     
 
     # 2. Generate Perturbation Noise
@@ -295,8 +403,21 @@ def roughen_mask_edges(mask: np.ndarray,
         seed=seed,
         octaves=4,        # 4 octaves usually sufficient for edge detail
         persistence=persistence,
-        lacunarity=lacunarity
+        lacunarity=lacunarity,
+        fractal_type=fractal_type
     )
+
+    # --- CRITICAL FIX FOR RIGID NOISE ---
+    if fractal_type == 'RigidMulti':
+        # 1. Invert: Turns "Mountain Ridges" (Jagged) into "Canyons" (Jagged)
+        #    This ensures the coastline cuts IN along the sharp lines.
+        noise_field = -noise_field 
+        
+        # 2. Center: Rigid noise is often positive [0, 1] or skewed.
+        #    We force it to roughly [-0.5, 0.5] so it distorts inward AND outward.
+        #    (Adjust '0.5' if your specific library output range differs)
+        noise_field = noise_field - np.mean(noise_field)
+
     
     # 3. Apply Distortion
     # We add noise to the distance. 
