@@ -190,16 +190,33 @@ class CoastalTaper:
     def apply(self, dem: np.ndarray) -> np.ndarray:
         """
         Multiplies the DEM by the generated taper map.
+        
+        FIX: Calculates in float32 to capture the gradient, then rounds 
+        and casts back to the original input type (e.g. int16) to save RAM.
         """
         if self.taper_map is None:
             raise ValueError("Run generate_taper_map() first.")
             
-        logger.info("Applying Coastal Taper to DEM...")
+        logger.info(f"Applying Coastal Taper (returning {dem.dtype})...")
         
-        # Convert Taper to DEM type (usually float32/64) just for the multiplication
-        # to avoid NumPy type errors, or rely on broadcasting.
-        # In-place multiplication if possible to save RAM.
-        return dem * self.taper_map.astype(dem.dtype)
+        # 1. Capture original type
+        original_dtype = dem.dtype
+        
+        # 2. Promote to float32 for calculation
+        # This prevents the 'int * float' issue where 0.99 becomes 0
+        dem_float = dem.astype(np.float32)
+        taper_float = self.taper_map.astype(np.float32)
+        
+        # 3. Multiply
+        result = dem_float * taper_float
+        
+        # 4. Cast back to original type
+        # If the input was integer (int16), we round to nearest to avoid 
+        # truncation bias (e.g., 99.9 becoming 99 instead of 100).
+        if np.issubdtype(original_dtype, np.integer):
+            return np.round(result).astype(original_dtype)
+        else:
+            return result.astype(original_dtype)
 
     def _downscale_mask(self, mask: np.ndarray, factor: float) -> np.ndarray:
         """Helper: shrinks the boolean mask."""

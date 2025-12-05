@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Union
 import numpy as np
 import rasterio
 from rasterio import features
@@ -11,6 +13,8 @@ import logging
 from typing import Dict, Any
 import os
 from joblib import Parallel, delayed
+
+from .topo import CoastalTaper
 
 # Ensure we have a logger
 logger = logging.getLogger(__name__)
@@ -427,3 +431,193 @@ def roughen_mask_edges(mask: np.ndarray,
     
     # Everything negative is the new Water
     return distorted_sdf < 0
+
+
+# ==========================================
+#             Fractal Blender elements
+# ==========================================
+
+
+@dataclass
+class FractalLayer:
+    """
+    Configuration for a single layer of procedural terrain noise.
+    """
+    name: str
+    seed: int
+    frequency_scale: float      # Horizontal size (Lower = Higher Freq/Detail)
+    vertical_scale: float       # Vertical amplitude (Meters)
+    
+    fractal_type: str = "FBM"   # "FBM", "RigidMulti", "Billow"
+    octaves: int = 6
+    persistence: float = 0.5
+    lacunarity: float = 2.0
+    
+    # Mask Config: None (Global), or a Dict defining the rule
+    # Examples:
+    #   None -> Apply Everywhere
+    #   {'type': 'vector_fade', 'vector_key': 'north', 'fade_km': 200.0}
+    #   {'type': 'altitude', 'min_height': 500.0, 'fade_height': 200.0}
+    mask_config: Optional[Dict[str, Any]] = None
+
+
+
+
+class FractalBlender:
+    """
+    Stateful processor that manages the generation and composition of 
+    fractal terrain layers.
+    
+    Separates concerns into:
+    1. Noise Generation (SIMD/Physics)
+    2. Mask Resolution (Spatial/Contextual)
+    3. Composition (Accumulation)
+    """
+    
+    def __init__(self, 
+                 base_dem: np.ndarray, 
+                 vector_context: Dict[str, gpd.GeoDataFrame], 
+                 profile: Dict[str, Any]):
+        """
+        Args:
+            base_dem: The starting elevation model (Canvas).
+            vector_context: Dictionary of loaded GeoDataFrames for masking.
+            profile: Rasterio profile (transform, crs) for aligning vectors.
+        """
+        self.profile = profile
+        self.vector_context = vector_context
+        
+        # Working state
+        self.shape = base_dem.shape
+        self.pixel_size = profile['transform'][0] # Assumes positive x-res
+        
+        # Initialize accumulator with base DEM (float32 for precision)
+        self.current_terrain = base_dem.astype(np.float32).copy()
+
+    def process(self, recipe: List[FractalLayer]) -> np.ndarray:
+        """
+        Main Entry Point: Iterates through the recipe and evolves the terrain.
+        """
+        logger.info(f"Starting Fractal Blender ({len(recipe)} layers)...")
+        
+        for i, layer in enumerate(recipe):
+            logger.info(f"  [{i+1}/{len(recipe)}] Processing Layer: {layer.name}")
+            self._process_single_layer(layer)
+            
+        return self.current_terrain
+
+    def _process_single_layer(self, layer: FractalLayer):
+        """
+        Orchestrates the lifecycle of a single layer to minimize RAM usage.
+        """
+        # A. Generate Noise
+        noise_map = self._generate_layer_noise(layer)
+        
+        # B. Resolve Mask (Control Signal)
+        mask_map = self._resolve_layer_mask(layer)
+        
+        # C. Composite
+        # Math: Terrain += Noise * Amplitude * Mask
+        contribution = noise_map * layer.vertical_scale * mask_map
+        self.current_terrain += contribution
+        
+        # D. Garbage Collection
+        # Explicit deletion to ensure immediate memory freeing
+        del noise_map
+        del mask_map
+        del contribution
+
+    def _generate_layer_noise(self, layer: FractalLayer) -> np.ndarray:
+        """
+        Concern: Physics & Patterns.
+        Handles SIMD generation and fractal-type specific post-processing.
+        """
+        height, width = self.shape
+        
+        raw_noise = _generate_noise_in_memory(
+            shape=(height, width),
+            scale=layer.frequency_scale,
+            seed=layer.seed,
+            octaves=layer.octaves,
+            persistence=layer.persistence,
+            lacunarity=layer.lacunarity,
+            fractal_type=layer.fractal_type
+        )
+        
+        # Post-Processing: Fix RigidMulti to look like mountains, not bubbles
+        if layer.fractal_type == 'RigidMulti':
+            # Invert: Turns "Ridges" into "Canyons" (or spikes if added)
+            # Center: Ensure it pushes up AND down
+            raw_noise = (raw_noise * -1.0) - np.mean(raw_noise * -1.0)
+            
+        return raw_noise
+
+    def _resolve_layer_mask(self, layer: FractalLayer) -> np.ndarray:
+        """
+        Concern: Context & Geography.
+        Interprets abstract mask configs into concrete 0.0-1.0 float arrays.
+        """
+        # Default: Global application (1.0 everywhere)
+        if not layer.mask_config:
+            return np.ones(self.shape, dtype=np.float32)
+
+        conf = layer.mask_config
+        m_type = conf.get('type')
+        
+        if m_type == 'vector_fade':
+            return self._create_vector_fade_mask(conf)
+        
+        elif m_type == 'altitude':
+            return self._create_altitude_mask(conf)
+        
+        else:
+            logger.warning(f"    Unknown mask type '{m_type}'. Applying globally.")
+            return np.ones(self.shape, dtype=np.float32)
+
+    def _create_vector_fade_mask(self, conf: Dict[str, Any]) -> np.ndarray:
+        """Helper for Vector Fade logic."""
+        vec_key = conf['vector_key']
+        fade_km = conf.get('fade_km', 100.0)
+        invert = conf.get('invert', False)
+        
+        if vec_key not in self.vector_context:
+            logger.warning(f"    Vector '{vec_key}' missing! Returning 0.0 mask.")
+            return np.zeros(self.shape, dtype=np.float32)
+            
+        # 1. Rasterize
+        bool_mask = vector_to_mask(self.vector_context[vec_key], self.profile)
+        
+        # 2. Distance Transform
+        # Calculate distance in pixels
+        dist_px = (fade_km * 1000) / self.pixel_size
+        
+        # Distance to the "Core" (True pixels)
+        # edt calculates distance to nearest zero, so we invert.
+        dist_to_core = ndimage.distance_transform_edt(~bool_mask)
+        
+        # 3. Normalize (Linear Fade)
+        # 1.0 inside, fading to 0.0 at dist_px
+        weight = 1.0 - (dist_to_core / dist_px)
+        weight = np.clip(weight, 0.0, 1.0)
+        
+        if invert:
+            return 1.0 - weight
+            
+        return weight.astype(np.float32)
+
+    def _create_altitude_mask(self, conf: Dict[str, Any]) -> np.ndarray:
+        """Helper for Altitude Ramp logic."""
+        min_h = conf.get('min_height', 0.0)
+        fade_h = conf.get('fade_height', 100.0)
+        
+        # Calculate Ramp based on CURRENT terrain state
+        # (Allows stacking mountains on top of previous layers)
+        ramp = (self.current_terrain - min_h) / fade_h
+        ramp = np.clip(ramp, 0.0, 1.0)
+        
+        return ramp.astype(np.float32)
+
+
+
+
+
