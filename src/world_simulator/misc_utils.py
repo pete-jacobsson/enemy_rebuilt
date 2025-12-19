@@ -10,7 +10,7 @@ import noise
 import pyfastnoisesimd as fns
 from tqdm import tqdm
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 from joblib import Parallel, delayed
 

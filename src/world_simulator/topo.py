@@ -1,3 +1,7 @@
+import cupy as cp
+import ctypes
+import glob
+
 from dataclasses import dataclass
 import geopandas as gpd
 import logging
@@ -15,16 +19,21 @@ from rasterio import features
 
 import networkx as nx
 import numpy as np
+import os
 import pandas as pd
+from pathlib import Path
 import rasterio
 
 from scipy import ndimage
 from scipy.ndimage import zoom
 import shapely
 from shapely.geometry import Point, LineString
+import sys
 
 from tqdm import tqdm
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union, Dict, Any, Tuple
+
+from time import time
 
 
 
@@ -288,6 +297,198 @@ class CoastalTaper:
 
         # Cast back to float16 to save RAM
         return upscaled.astype(np.float16)
+
+
+
+###################################################################################################
+#########  DEM Topography smoothing with CuPy
+###################################################################################################
+
+import cupy as cp
+import rasterio
+import numpy as np
+from pathlib import Path
+from typing import Tuple, Optional, Union
+
+class GPUThermalEroder:
+    """
+    A GPU-accelerated implementation of thermal erosion (granular diffusion) 
+    using Cellular Automata on a raster grid.
+    This is a pure-Python/CuPy implementation of thermal erosion that does NOT require 
+    the NVRTC compiler. It uses vectorized array operations.
+
+    Mathematical Model:
+    -------------------
+    The simulation models the terrain as a grid of discrete cells where material 
+    moves from a center cell $C$ to its neighbors $N_i$ (North, South, East, West) 
+    if the slope exceeds a critical stability threshold (Talus Angle).
+
+    For each neighbor $N_i$, we calculate the height difference:
+    $$ Delta h_i = H_C - H_{N_i} $$
+
+    Material flows only if the difference exceeds the Talus Threshold $T$:
+    $$ text{Flow}_i = begin{cases} Delta h_i - T & text{if } Delta h_i > T  0 & text{otherwise} end{cases} $$
+
+    The total material removed from the center cell is proportional to the sum of flows, 
+    scaled by an erosion rate $R$ (relaxation constant, $0 < R le 0.5$):
+    $$ Delta H_C = - R cdot sum text{Flow}_i $$
+
+    This creates a non-linear diffusion process where plateaus remain stable until 
+    their edges are "eaten away" by the critical angle constraint, naturally forming 
+    conical slopes.
+
+    Attributes:
+        talus_threshold (float): The height difference required to trigger material movement.
+        erosion_rate (float): The speed of the simulation (stability factor).
+
+
+    # --- Usage Example ---
+    if __name__ == "__main__":
+        eroder = GPUThermalEroder(talus_threshold=2.5, erosion_rate=0.1)
+        
+        # 1. Load
+        raw_dem = eroder.load_dem("input_blocky.tif")
+        
+        # 2. Process
+        smoothed_dem = eroder.process(raw_dem, iterations=200)
+        
+        # 3. Save
+        eroder.save_dem(smoothed_dem, "output_smooth_gpu.tif")
+        print("Done.")
+        
+    """
+
+    def __init__(self, talus_threshold: float = 4.0, erosion_rate: float = 0.1):
+        # 1. Fix the environment BEFORE doing anything CUDA-related
+        self._ensure_nvrtc_loaded()
+        
+        self.talus = talus_threshold
+        self.rate = erosion_rate
+        
+        # 2. Compile Kernel (This is where it would normally fail)
+        self.kernel = self._compile_kernel()
+        self.profile = None
+
+    def _ensure_nvrtc_loaded(self):
+        """
+        Private Helper: Dynamically finds and force-loads the NVRTC library 
+        into the process memory to prevent CuPy 'OSError' on conda envs.
+        """
+        try:
+            # We don't want to reload it if it's already there
+            # (Checks if a known NVRTC symbol exists in the current process)
+            try:
+                ctypes.CDLL("libnvrtc.so.12")
+                return # Already loaded by system, we are good.
+            except OSError:
+                pass # Not found, let's go hunting.
+
+            # Dynamic path finding: Look inside the current Conda/Python environment
+            # This avoids hardcoding '/home/pete/...'
+            base_prefix = sys.prefix
+            
+            # Pattern to find the library deeply nested in site-packages
+            # Works for Python 3.10, 3.11, 3.12 etc.
+            search_pattern = os.path.join(
+                base_prefix, 
+                "lib", "python*", "site-packages", "nvidia", 
+                "cuda_nvrtc", "lib", "libnvrtc.so.12"
+            )
+            
+            matches = glob.glob(search_pattern)
+            
+            if not matches:
+                # Fallback: Try looking in the general lib folder (sometimes simpler envs put it there)
+                search_pattern = os.path.join(base_prefix, "lib", "libnvrtc.so.12")
+                matches = glob.glob(search_pattern)
+
+            if matches:
+                target_lib = matches[0]
+                # Force load with RTLD_GLOBAL so CuPy can "see" it
+                ctypes.CDLL(target_lib, mode=ctypes.RTLD_GLOBAL)
+                # print(f"DEBUG: Auto-patched NVRTC from {target_lib}")
+            else:
+                print("WARNING: Could not auto-locate libnvrtc.so.12. Kernel compilation may fail.")
+
+        except Exception as e:
+            print(f"WARNING: NVRTC patch failed: {e}")
+
+    def _compile_kernel(self) -> cp.RawKernel:
+        # ... (Same kernel code as before) ...
+        kernel_code = r'''
+        extern "C" __global__
+        void thermal_erode(const float* src, float* dst, 
+                           int width, int height, 
+                           float talus_threshold, float erosion_rate) {
+            
+            int x = blockIdx.x * blockDim.x + threadIdx.x;
+            int y = blockIdx.y * blockDim.y + threadIdx.y;
+            int idx = y * width + x;
+
+            if (x >= width || y >= height) return;
+
+            float h = src[idx];
+            
+            // Boundary Conditions
+            if (h <= 0.0f || x == 0 || x == width - 1 || y == 0 || y == height - 1) {
+                dst[idx] = h;
+                return;
+            }
+
+            int n_idxs[4] = {
+                (y - 1) * width + x, (y + 1) * width + x,
+                y * width + (x - 1), y * width + (x + 1)
+            };
+
+            float flow_total = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                float diff = h - src[n_idxs[i]];
+                if (diff > talus_threshold) {
+                    flow_total += (diff - talus_threshold);
+                }
+            }
+            dst[idx] = h - (flow_total * erosion_rate);
+        }
+        '''
+        return cp.RawKernel(kernel_code, 'thermal_erode')
+
+    # ... (Rest of the class: load_dem, process, save_dem) ...
+    def load_dem(self, filepath: Union[str, Path]) -> np.ndarray:
+        with rasterio.open(filepath) as src:
+            self.profile = src.profile
+            return src.read(1).astype(np.float32)
+
+    def process(self, dem: np.ndarray, iterations: int = 100) -> np.ndarray:
+        height, width = dem.shape
+        buf_a = cp.asarray(dem)
+        buf_b = cp.empty_like(buf_a)
+        
+        threads = (16, 16)
+        blocks_x = (width + threads[0] - 1) // threads[0]
+        blocks_y = (height + threads[1] - 1) // threads[1]
+        grid = (blocks_x, blocks_y)
+        
+        # print(f"Processing on GPU: {width}x{height} for {iterations} iters...")
+        
+        for i in range(iterations):
+            src, dst = (buf_a, buf_b) if i % 2 == 0 else (buf_b, buf_a)
+            self.kernel(grid, threads, (
+                src, dst, width, height, 
+                cp.float32(self.talus), cp.float32(self.rate)
+            ))
+
+        final_gpu = buf_b if iterations % 2 != 0 else buf_a
+        return cp.asnumpy(final_gpu)
+
+    def save_dem(self, dem: np.ndarray, filepath: Union[str, Path]) -> None:
+        output_data = np.round(dem).astype(np.int16)
+        save_profile = self.profile.copy()
+        save_profile.update({'dtype': 'int16', 'nodata': None, 'compress': 'lzw'})
+        with rasterio.open(filepath, 'w', **save_profile) as dst:
+            dst.write(output_data, 1)
+
+
+
 
 
 
