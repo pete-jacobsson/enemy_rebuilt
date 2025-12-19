@@ -159,16 +159,80 @@ class CoastalTaper:
     2. Float16: Uses half-precision floats for the mask to save ~300MB RAM.
     """
     
-    def __init__(self, sea_mask: np.ndarray, taper_distance_px: float):
+    def __init__(self, taper_distance_px: float):
         """
         Args:
-            sea_mask: Boolean mask (True = Sea).
             taper_distance_px: Distance in pixels over which the land fades in.
         """
-        self.sea_mask = sea_mask
         self.taper_dist = taper_distance_px
+        
+        # State populated by load_inputs
+        self.sea_mask = None
+        self.profile = None
+        self.valid_data_mask = None # Tracks where original DEM had data
         self.taper_map = None
 
+    def load_inputs(self, dem_path: str, sea_vector: Union[str, gpd.GeoDataFrame]):
+        """
+        Loads the DEM to get dimensions/profile and rasterizes the sea vector 
+        to create the internal boolean mask.
+
+        Args:
+            dem_path: Path to the reference DEM.
+            sea_vector: Path to vector file OR loaded GeoDataFrame of the sea.
+        
+        Returns:
+            np.ndarray: The loaded DEM data (float32).
+        """
+        logger.info(f"Loading inputs from {dem_path}...")
+        
+        # 1. Load Reference DEM and Profile
+        with rasterio.open(dem_path) as src:
+            self.profile = src.profile
+            dem_data = src.read(1)
+            
+            # Handle NoData: Create a mask of valid pixels to restore later
+            nodata_val = src.nodata
+            if nodata_val is not None:
+                # Use a small epsilon for float safety, or direct comparison for others
+                if np.issubdtype(dem_data.dtype, np.floating):
+                    self.valid_data_mask = ~np.isclose(dem_data, nodata_val)
+                else:
+                    self.valid_data_mask = (dem_data != nodata_val)
+            else:
+                self.valid_data_mask = np.ones(dem_data.shape, dtype=bool)
+
+        # 2. Handle Vector Input
+        if isinstance(sea_vector, (str, Path)):
+            logger.info("Loading Sea Vector from disk...")
+            sea_gdf = gpd.read_file(sea_vector)
+        else:
+            sea_gdf = sea_vector
+
+        # 3. Internal Vector-to-Mask (Rasterization)
+        logger.info("Rasterizing Sea Vector to match DEM profile...")
+        
+        if sea_gdf is None or sea_gdf.empty:
+            logger.warning("Empty vector provided. Assuming NO SEA.")
+            self.sea_mask = np.zeros(dem_data.shape, dtype=bool)
+        else:
+            # Burn '1' where polygons exist
+            shapes = ((geom, 1) for geom in sea_gdf.geometry)
+            
+            mask_uint8 = features.rasterize(
+                shapes=shapes,
+                out_shape=(self.profile['height'], self.profile['width']),
+                transform=self.profile['transform'],
+                fill=0,
+                dtype=rasterio.uint8
+            )
+            self.sea_mask = mask_uint8.astype(bool)
+
+        return dem_data.astype(np.float32)
+
+
+
+    
     def generate_taper_map(self, power: float = 2.0, downsample_factor: float = 0.1) -> np.ndarray:
         """
         Orchestrator: Generates the attenuation map using low-res approximation.
@@ -298,7 +362,47 @@ class CoastalTaper:
         # Cast back to float16 to save RAM
         return upscaled.astype(np.float16)
 
+    
+    def save_result(self, dem: np.ndarray, output_path: str):
+        """
+        Saves the processed DEM as Int16, handling NoData correctly.
+        
+        Logic:
+        1. Resets off-map pixels (NoData) to -32768.
+        2. Rounds valid pixels to nearest integer.
+        3. Saves with LZW compression.
+        """
+        if self.profile is None:
+            raise ValueError("No profile context. Run load_inputs() first.")
+            
+        logger.info(f"Saving result to {output_path} as Int16...")
 
+        # 1. Prepare Output Array (Default to Int16 Min value)
+        int16_nodata = -32768
+        output_data = np.full(dem.shape, int16_nodata, dtype=np.int16)
+
+        # 2. Populate only VALID pixels
+        # We use the valid_data_mask captured during load_inputs
+        # to ensure we don't accidentally turn a void (-9999) into a tapered zero.
+        if self.valid_data_mask is not None:
+            # Round float result to nearest int before casting
+            valid_pixels = dem[self.valid_data_mask]
+            output_data[self.valid_data_mask] = np.round(valid_pixels).astype(np.int16)
+        else:
+            output_data = np.round(dem).astype(np.int16)
+
+        # 3. Update Profile
+        save_profile = self.profile.copy()
+        save_profile.update({
+            'dtype': 'int16',
+            'nodata': int16_nodata,
+            'compress': 'lzw',
+            'driver': 'GTiff'
+        })
+
+        # 4. Write
+        with rasterio.open(output_path, 'w', **save_profile) as dst:
+            dst.write(output_data, 1)
 
 ###################################################################################################
 #########  DEM Topography smoothing with CuPy
@@ -414,12 +518,12 @@ class GPUThermalEroder:
             print(f"WARNING: NVRTC patch failed: {e}")
 
     def _compile_kernel(self) -> cp.RawKernel:
-        # ... (Same kernel code as before) ...
         kernel_code = r'''
         extern "C" __global__
         void thermal_erode(const float* src, float* dst, 
                            int width, int height, 
-                           float talus_threshold, float erosion_rate) {
+                           float talus_threshold, float erosion_rate,
+                           float nodata_val) {  // <--- NEW PARAMETER
             
             int x = blockIdx.x * blockDim.x + threadIdx.x;
             int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -429,7 +533,14 @@ class GPUThermalEroder:
 
             float h = src[idx];
             
-            // Boundary Conditions
+            // 1. Ignore NoData pixels entirely (Preserve them)
+            // We use a small epsilon for float comparison safety
+            if (abs(h - nodata_val) < 1e-6) {
+                dst[idx] = h;
+                return;
+            }
+            
+            // 2. Boundary Conditions (Map Edges & Sea Level)
             if (h <= 0.0f || x == 0 || x == width - 1 || y == 0 || y == height - 1) {
                 dst[idx] = h;
                 return;
@@ -442,7 +553,16 @@ class GPUThermalEroder:
 
             float flow_total = 0.0f;
             for (int i = 0; i < 4; i++) {
-                float diff = h - src[n_idxs[i]];
+                float neighbor_h = src[n_idxs[i]];
+
+                // 3. Check Neighbor Validity
+                // If neighbor is NoData, treat it like a wall (infinite height) 
+                // so material does NOT flow into the void.
+                if (abs(neighbor_h - nodata_val) < 1e-6) {
+                    continue; 
+                }
+
+                float diff = h - neighbor_h;
                 if (diff > talus_threshold) {
                     flow_total += (diff - talus_threshold);
                 }
@@ -460,6 +580,11 @@ class GPUThermalEroder:
 
     def process(self, dem: np.ndarray, iterations: int = 100) -> np.ndarray:
         height, width = dem.shape
+        
+        # <--- NEW: Detect NoData value (default to -9999 if not in profile)
+        nodata_val = self.profile.get('nodata', -9999.0)
+        if nodata_val is None: nodata_val = -9999.0 # Fallback
+        
         buf_a = cp.asarray(dem)
         buf_b = cp.empty_like(buf_a)
         
@@ -468,22 +593,37 @@ class GPUThermalEroder:
         blocks_y = (height + threads[1] - 1) // threads[1]
         grid = (blocks_x, blocks_y)
         
-        # print(f"Processing on GPU: {width}x{height} for {iterations} iters...")
-        
         for i in range(iterations):
             src, dst = (buf_a, buf_b) if i % 2 == 0 else (buf_b, buf_a)
             self.kernel(grid, threads, (
                 src, dst, width, height, 
-                cp.float32(self.talus), cp.float32(self.rate)
+                cp.float32(self.talus), 
+                cp.float32(self.rate),
+                cp.float32(nodata_val) # <--- NEW ARGUMENT
             ))
 
         final_gpu = buf_b if iterations % 2 != 0 else buf_a
         return cp.asnumpy(final_gpu)
 
     def save_dem(self, dem: np.ndarray, filepath: Union[str, Path]) -> None:
-        output_data = np.round(dem).astype(np.int16)
+        # <--- NEW: Handle NoData preservation during cast
+        nodata_val = self.profile.get('nodata', -9999.0)
+        
+        # Create a mask of valid data before rounding
+        # (Assuming NoData is distinct enough, e.g. < -1000)
+        valid_mask = (dem != nodata_val)
+        
+        output_data = np.full(dem.shape, -32768, dtype=np.int16) # Initialize with int16 min
+        
+        # Only round and cast valid pixels
+        output_data[valid_mask] = np.round(dem[valid_mask]).astype(np.int16)
+
         save_profile = self.profile.copy()
-        save_profile.update({'dtype': 'int16', 'nodata': None, 'compress': 'lzw'})
+        save_profile.update({
+            'dtype': 'int16',
+            'nodata': -32768, # <--- Set standard Int16 NoData
+            'compress': 'lzw'
+        })
         with rasterio.open(filepath, 'w', **save_profile) as dst:
             dst.write(output_data, 1)
 
