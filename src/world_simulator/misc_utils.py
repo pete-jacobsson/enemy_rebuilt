@@ -820,7 +820,59 @@ def generate_fractal_mask(mask: np.ndarray,
 
 
 
+def repair_mask_artifacts(fractal_mask: np.ndarray, 
+                          reference_mask: np.ndarray, 
+                          boxes: List[Tuple[int, int, int, int]], 
+                          base_dem: np.ndarray,
+                          nodata_value: float = -32768) -> np.ndarray:
+    """
+    Surgically restores the original 'clean' mask state within specific boxes 
+    to fix artifacts where fractal noise has distorted artificial map boundaries.
 
+    Logic:
+    1. Inside the box, revert the Fractal Mask to match the Reference Mask.
+    2. Ensure no mask (True) exists where the Base DEM is NoData.
+
+    Args:
+        fractal_mask: The noisy, fractalized boolean mask to fix.
+        reference_mask: The original, smooth boolean mask (Source of Truth).
+        boxes: List of (West, North, East, South) tuples defining the repair zones.
+        base_dem: The elevation array (used to check for valid data).
+        nodata_value: The value in base_dem representing void/no-data.
+
+    Returns:
+        np.ndarray: The repaired fractal mask.
+    """
+    if not boxes:
+        return fractal_mask
+
+    # Work on a copy to avoid side effects
+    repaired = fractal_mask.copy()
+    
+    # Identify Valid Data (Where the world actually exists)
+    # Handle NaN if the DEM is float, otherwise check value
+    if np.isnan(nodata_value):
+        valid_data = ~np.isnan(base_dem)
+    else:
+        valid_data = (base_dem != nodata_value)
+
+    logger.info(f"Repairing artifacts in {len(boxes)} zones...")
+
+    for box in boxes:
+        x_min, y_min, x_max, y_max = box
+        
+        # Clamp to array bounds
+        x_min, y_min = max(0, x_min), max(0, y_min)
+        x_max, y_max = min(repaired.shape[1], x_max), min(repaired.shape[0], y_max)
+
+        # 1. Surgical Graft: Revert to the reference (straight/clean) state
+        repaired[y_min:y_max, x_min:x_max] = reference_mask[y_min:y_max, x_min:x_max]
+        
+        # 2. Void Clip: Ensure we didn't just paste 'Sea' into a 'NoData' void
+        # We perform a bitwise AND with the valid data mask in this region
+        repaired[y_min:y_max, x_min:x_max] &= valid_data[y_min:y_max, x_min:x_max]
+
+    return repaired
 
 
 
