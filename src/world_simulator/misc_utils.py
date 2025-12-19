@@ -4,13 +4,13 @@ import numpy as np
 import rasterio
 from rasterio import features
 import geopandas as gpd
-from scipy import ndimage
-from scipy.ndimage import gaussian_filter
+from scipy import ndimage, stats
+from scipy.ndimage import gaussian_filter, binary_dilation, binary_erosion, generate_binary_structure
 import noise
 import pyfastnoisesimd as fns
 from tqdm import tqdm
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import os
 from joblib import Parallel, delayed
 
@@ -616,6 +616,209 @@ class FractalBlender:
         ramp = np.clip(ramp, 0.0, 1.0)
         
         return ramp.astype(np.float32)
+
+
+
+
+
+
+# ==========================================
+#          FRACTAL ANALYSIS TOOLS
+# ==========================================
+
+class MeasureFractalDimension:
+    """
+    Calculates the Minkowski-Bouligand (Fractal) Dimension of a binary mask's boundary
+    using the Box-Counting method.
+    
+    Handles GIS artifacts by allowing specific 'Exclusion Boxes' (WNES) where 
+    edges should be ignored (e.g., map borders or data-void rectangles).
+    """
+
+    def __init__(self, 
+                 min_scale: int = 16, 
+                 max_scale: int = 512, 
+                 threshold: float = 0.5):
+        """
+        Args:
+            min_scale: Smallest box size (pixels). Values < 16 often capture square-pixel artifacts.
+            max_scale: Largest box size (pixels).
+            threshold: Value to convert float masks to boolean.
+        """
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.threshold = threshold
+
+    def calculate(self, 
+                  mask: np.ndarray, 
+                  exclusion_boxes: Optional[List[Tuple[int, int, int, int]]] = None) -> float:
+        """
+        Computes the fractal dimension (D).
+
+        Args:
+            mask: The binary mask (True=Feature, False=Background).
+            exclusion_boxes: A list of (West_Col, North_Row, East_Col, South_Row) tuples.
+                             Edges found within these pixel rectangles will be treated as 
+                             artifacts and excluded from the calculation.
+                             Example: [(0, 0, 100, 16000)] ignores the left 100px.
+
+        Returns:
+            float: Estimated Fractal Dimension (D). 
+                   ~1.1 (Smooth) to ~1.4 (Rugged). Returns 1.0 if no valid edges found.
+        """
+        binary_mask = (mask > self.threshold).astype(bool)
+        
+        # 1. Detect Edges
+        edges = self._detect_edges(binary_mask)
+        
+        # 2. Clean Artifacts
+        clean_edges = self._mask_artificial_boundaries(edges, exclusion_boxes)
+
+        if np.sum(clean_edges) == 0:
+            logger.warning("No valid edges found after exclusion. Returning D=1.0")
+            return 1.0
+
+        # 3. Box Counting
+        scales, counts = self._box_count_geometric(clean_edges)
+
+        # 4. Regression
+        return self._regress(scales, counts)
+
+    def _detect_edges(self, mask: np.ndarray) -> np.ndarray:
+        """Finds the boundary pixels using morphological gradient."""
+        struct = generate_binary_structure(2, 1) # 4-connectivity
+        eroded = binary_erosion(mask, structure=struct)
+        dilated = binary_dilation(mask, structure=struct)
+        return dilated ^ eroded
+
+    def _mask_artificial_boundaries(self, 
+                                    edges: np.ndarray, 
+                                    exclusion_boxes: Optional[List[Tuple[int, int, int, int]]]) -> np.ndarray:
+        """
+        Removes edges that coincide with the array border or user-defined boxes.
+        """
+        height, width = edges.shape
+        artifact_mask = np.zeros_like(edges, dtype=bool)
+
+        # A. Always ignore the 1-pixel image border (The "Frame")
+        artifact_mask[0, :] = True
+        artifact_mask[-1, :] = True
+        artifact_mask[:, 0] = True
+        artifact_mask[:, -1] = True
+
+        # B. User Exclusion Boxes (WNES)
+        if exclusion_boxes:
+            for box in exclusion_boxes:
+                # Unpack (West=MinCol, North=MinRow, East=MaxCol, South=MaxRow)
+                x_min, y_min, x_max, y_max = box
+                
+                # Clamp to image bounds
+                x_min = max(0, x_min)
+                y_min = max(0, y_min)
+                x_max = min(width, x_max)
+                y_max = min(height, y_max)
+                
+                # Mark region
+                artifact_mask[y_min:y_max, x_min:x_max] = True
+
+        return edges & (~artifact_mask)
+
+    def _box_count_geometric(self, edges: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Counts occupied boxes for scales 2^N."""
+        pixels = np.column_stack(np.where(edges > 0)) # (Rows, Cols)
+        
+        scales = []
+        counts = []
+
+        current_scale = self.max_scale
+        while current_scale >= self.min_scale:
+            # Floor divide to assign pixels to boxes
+            box_indices = np.floor(pixels / current_scale).astype(int)
+            unique_boxes = np.unique(box_indices, axis=0)
+            
+            count = unique_boxes.shape[0]
+            if count > 0:
+                scales.append(current_scale)
+                counts.append(count)
+            
+            current_scale //= 2
+
+        return np.array(scales), np.array(counts)
+
+    def _regress(self, scales: np.ndarray, counts: np.ndarray) -> float:
+        """Log-Log regression to find slope."""
+        if len(scales) < 2:
+            return 1.0
+        
+        log_s = np.log(scales)
+        log_n = np.log(counts)
+        slope, _, _, _, _ = stats.linregress(log_s, log_n)
+        return -slope
+
+# --- Functional Wrappers ---
+
+def measure_fractal_dimension(mask: np.ndarray, 
+                              min_scale: int = 16, 
+                              max_scale: int = 512,
+                              exclusion_boxes: Optional[List[Tuple[int, int, int, int]]] = None) -> float:
+    """
+    Calculate the fractal dimension of a mask's edge.
+    
+    Args:
+        mask: Binary numpy array.
+        min_scale: Ignore details smaller than this (pixels).
+        max_scale: Max box size (pixels).
+        exclusion_boxes: List of (West_Col, North_Row, East_Col, South_Row) to ignore.
+    """
+    analyzer = MeasureFractalDimension(min_scale, max_scale)
+    return analyzer.calculate(mask, exclusion_boxes)
+
+def generate_fractal_mask(mask: np.ndarray,
+                          fractal_dimension: float,
+                          scale: float = 20.0,
+                          seed: int = 42) -> np.ndarray:
+    """
+    Upscales a coarse boolean mask by adding sub-pixel fractal detail
+    matching a target Fractal Dimension (D).
+    
+    Math: Persistence = 2^(D - 2).
+    """
+    height, width = mask.shape
+    
+    # 1. Calculate Persistence from D
+    # D=1.1 -> P=0.53 (Smooth)
+    # D=1.3 -> P=0.61 (Rocky)
+    persistence = 2.0**(fractal_dimension - 2.0)
+    
+    # 2. Generate Domain Warping Noise
+    # We use high-freq noise to distort the edge
+    noise_field = _generate_noise_in_memory(
+        shape=(height, width),
+        scale=scale,
+        seed=seed,
+        octaves=4,
+        persistence=persistence, # <--- Controlled by D
+        lacunarity=2.0
+    )
+    
+    # 3. Signed Distance Field of original mask
+    # Approx 20km buffer (depends on resolution, 160px @ 125m)
+    dist_outside = stats.mstats.winsorize(np.zeros_like(mask), limits=None) # Placeholder import check? 
+    # Actually we use ndimage
+    from scipy import ndimage
+    dist_outside = ndimage.distance_transform_edt(~mask)
+    dist_inside = ndimage.distance_transform_edt(mask)
+    sdf = dist_outside - dist_inside
+    
+    # 4. Perturb
+    # Magnitude should relate to scale. 
+    # If blocks are ~1km (8px), we want ~8px distortion
+    magnitude = scale * 0.75 
+    distorted_sdf = sdf + (noise_field * magnitude)
+    
+    return distorted_sdf < 0
+
+
 
 
 
