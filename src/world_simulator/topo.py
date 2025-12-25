@@ -25,7 +25,7 @@ from pathlib import Path
 import rasterio
 
 from scipy import ndimage
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, uniform_filter
 import shapely
 from shapely.geometry import Point, LineString
 import sys
@@ -628,113 +628,82 @@ class GPUThermalEroder:
             dst.write(output_data, 1)
 
 
-
-
-
-
-
-
-
-
-### OLD STUFF ##########
-# @dataclass
-# class NoiseRule:
-#     """
-#     Defines a specific layer of fractal noise to be added to the terrain.
-#     """
-#     seed: int
-#     multiplier: float           # Vertical scale (e.g., 800.0)
-#     scale: float                # Horizontal scale (e.g., 50.0 for mountains, 400.0 for hills)
-#     min_elevation: float = -99999.0  # Apply only above this altitude in Base DEM
-#     mask_layer: str = None      # Name of mask in mask_library (e.g., 'north')
-#     octaves: int = 6
-#     persistence: float = 0.5
-#     lacunarity: float = 2.0
-
-
-
-# def apply_noise_rules(base_dem: np.ndarray, 
-#                       rules: List[NoiseRule], 
-#                       mask_library: Dict[str, np.ndarray] = {}) -> np.ndarray:
-#     """
-#     The Master Compositor. Stacks multiple noise layers onto the base DEM.
+def destep_terrain(dem_array, nodata_value, radius=64, iterations=3, scale_factor=2):
+    """
+    Applies a 'Normalized Convolution' iterative box blur to a quantized DEM.
+    This ensures smooth slopes without 'smearing' Nodata values into valid terrain.
     
-#     LOGIC UPDATE:
-#     - If a rule has BOTH min_elevation AND a mask_layer, they are combined with OR (|).
-#       (e.g., "Apply if > 500m OR inside North mask").
-#     - If a rule has only one, it applies that one.
-#     - If a rule has neither, it applies everywhere.
+    Parameters:
+        dem_array (numpy array): Input elevation data.
+        nodata_value (float/int): The value representing void data (e.g. -32768).
+        radius (int): Smoothing radius.
+        iterations (int): Number of passes.
+        scale_factor (int): Multiplier for vertical precision.
     
-#     Args:
-#         base_dem: The starting topography (NumPy array).
-#         rules: List of NoiseRule objects defining the layers.
-#         mask_library: Dictionary mapping names ('north', 'sea') to Numpy Boolean Arrays.
-        
-#     Returns:
-#         np.ndarray: The final composite terrain.
-#     """
-#     logger.info(f"Applying {len(rules)} noise rules to base terrain...")
+    Returns:
+        numpy array: Smoothed terrain as int16 (with original nodata restored).
+    """
+    print(f"--- Starting Nodata-Aware De-stepping (R={radius}, I={iterations}) ---")
     
-#     # 1. Copy Base DEM (Float32 for precision)
-#     final_dem = base_dem.astype(np.float32).copy()
-#     height, width = final_dem.shape
+    # 1. Identify Valid Data
+    # Create a boolean mask: 1.0 where data exists, 0.0 where it's void
+    # handle NaN if present, otherwise check equality
+    if np.isnan(nodata_value):
+        valid_mask = ~np.isnan(dem_array)
+    else:
+        valid_mask = (dem_array != nodata_value)
     
-#     for i, rule in enumerate(rules):
-#         logger.info(f"  Rule {i+1}: Scale={rule.scale}, Mult={rule.multiplier}, Seed={rule.seed}")
+    # 2. Prepare Float Arrays
+    # Convert data to float and scale
+    working_data = dem_array.astype(np.float32) * scale_factor
+    
+    # CRITICAL: Set Nodata pixels to exactly 0.0 in the data array
+    # This prevents the massive negative numbers from influencing the sum.
+    working_data[~valid_mask] = 0.0
+    
+    # Create a float weight mask (0.0 or 1.0)
+    weight_mask = valid_mask.astype(np.float32)
+    
+    window_size = (radius * 2) + 1
+    
+    # 3. Iterative Normalized Convolution
+    for i in range(iterations):
+        print(f"  > Blur Pass {i+1}/{iterations}...")
         
-#         # 2. Generate Raw Noise
-#         raw_noise = _generate_noise_in_memory(
-#             shape=(height, width),
-#             scale=rule.scale,
-#             seed=rule.seed,
-#             octaves=rule.octaves,
-#             persistence=rule.persistence,
-#             lacunarity=rule.lacunarity
-#         )
+        # A. Blur the Data (Accumulates sum of neighbors, treating nodata as 0)
+        # We use mode='constant' (cval=0) so image edges behave like Nodata
+        blurred_data = uniform_filter(working_data, size=window_size, mode='constant', cval=0.0)
         
-#         # 3. Scale Noise
-#         scaled_noise = raw_noise * rule.multiplier
+        # B. Blur the Mask (Accumulates count of valid neighbors)
+        blurred_weights = uniform_filter(weight_mask, size=window_size, mode='constant', cval=0.0)
         
-#         # 4. Build Application Mask (The OR Logic)
+        # C. Normalize (Average = Sum / Count)
+        # Avoid division by zero where weights are 0 (pure nodata zones)
+        non_zero_weights = blurred_weights > 1e-6
         
-#         # Check which conditions are active
-#         has_elevation = rule.min_elevation > -9999.0
-#         has_mask = (rule.mask_layer is not None)
+        # Update working data:
+        # Where we have valid neighbors, calculate the weighted average.
+        # Where we have NO valid neighbors, keep as 0.0.
+        working_data[non_zero_weights] = blurred_data[non_zero_weights] / blurred_weights[non_zero_weights]
         
-#         # Resolve the mask layer if it exists
-#         spatial_mask = None
-#         if has_mask:
-#             if rule.mask_layer in mask_library:
-#                 spatial_mask = mask_library[rule.mask_layer]
-#             else:
-#                 logger.warning(f"    Mask '{rule.mask_layer}' not found! Ignoring mask condition.")
-#                 has_mask = False
-
-#         # Combine Conditions
-#         if has_elevation and has_mask:
-#             # Elevation OR Mask
-#             elevation_mask = (base_dem >= rule.min_elevation)
-#             app_mask = elevation_mask | spatial_mask
-#             logger.info(f"    Filtered by Elevation > {rule.min_elevation} OR Mask '{rule.mask_layer}'")
-            
-#         elif has_elevation:
-#             # Only Elevation
-#             app_mask = (base_dem >= rule.min_elevation)
-#             logger.info(f"    Filtered by Elevation > {rule.min_elevation}")
-            
-#         elif has_mask:
-#             # Only Mask
-#             app_mask = spatial_mask
-#             logger.info(f"    Filtered by Mask '{rule.mask_layer}'")
-            
-#         else:
-#             # No filters -> Global
-#             app_mask = np.ones((height, width), dtype=bool)
-#             logger.info(f"    No filters (Global application)")
-
-#         # 5. Apply
-#         final_dem[app_mask] += scaled_noise[app_mask]
+        # Note: We do NOT re-apply the mask to 0.0 here yet, allowing valid data 
+        # to 'bleed' slightly into the void to smooth the edge, 
+        # but we effectively clamp the result later.
         
-#     logger.info("Terrain composition complete.")
-#     return final_dem
-
+        # For the next pass, the weight_mask remains the same (original validity)
+        # or we could blur the weights too? 
+        # Standard approach: Keep weight_mask static to strictly smooth *existing* valid geometry
+        # without hallucinating new terrain into the void.
+        
+    # 4. Restore Nodata & Cast
+    print("Restoring Nodata and quantizing...")
+    
+    # Round to integer
+    final_output = np.round(working_data).astype(np.int16)
+    
+    # Hard reset of original nodata positions
+    # (Optional: remove this if you WANT the terrain to expand into the void slightly)
+    # Given the user request "bands at intersections", strict masking is safer.
+    final_output[~valid_mask] = int(nodata_value)
+    
+    return final_output
