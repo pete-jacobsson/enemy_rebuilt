@@ -707,3 +707,51 @@ def destep_terrain(dem_array, nodata_value, radius=64, iterations=3, scale_facto
     final_output[~valid_mask] = int(nodata_value)
     
     return final_output
+
+
+import numpy as np
+
+def apply_zone_elevation_change(dem_array, mask_array, zone_id, elevation_change_m, scale_factor=2, nodata_value=-32768):
+    """
+    Applies a uniform elevation change to a specific geological zone.
+    
+    Parameters:
+        dem_array (numpy array): The source elevation raster (int16).
+        mask_array (numpy array): The geological zone mask (uint8).
+        zone_id (int): The specific zone value to target (e.g., 3).
+        elevation_change_m (float): Amount to uplift (+) or depress (-) in meters.
+        scale_factor (int): Multiplier used in the DEM (e.g. 2 means 1m = 2 units).
+        nodata_value (int): Value to ignore/preserve.
+        
+    Returns:
+        numpy array: Modified DEM.
+    """
+    print(f"--- Applying Zonal Uplift (Zone {zone_id}: {elevation_change_m}m) ---")
+    
+    # 1. Calculate Shift in Internal Units
+    # elevation_change_m can be positive (uplift) or negative (subsidence)
+    shift_units = int(elevation_change_m * scale_factor)
+    
+    if shift_units == 0:
+        print("  > No change calculated. Returning original.")
+        return dem_array
+    
+    # 2. Create Working Copy
+    # We work on a copy to preserve the input array state if needed elsewhere
+    modified_dem = dem_array.copy()
+    
+    # 3. Create Selection Mask
+    # Target pixels that belong to the zone AND are not nodata
+    # (Handling nodata check ensures we don't uplift the void)
+    target_pixels = (mask_array == zone_id) & (modified_dem != nodata_value)
+    
+    count = np.sum(target_pixels)
+    print(f"  > Targeted {count} pixels.")
+    
+    # 4. Apply Uplift
+    # We use numpy in-place addition for speed
+    # We assume int16 is sufficient (max height ~32000m). 
+    # If you expect overflow, we could clamp, but for +200m it is safe.
+    modified_dem[target_pixels] += shift_units
+    
+    return modified_dem

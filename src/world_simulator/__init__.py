@@ -6,7 +6,8 @@ from .topo import (
     flatten_lakes_smart, 
     CoastalTaper, 
     GPUThermalEroder,
-    destep_terrain
+    destep_terrain,
+    apply_zone_elevation_change
 )
 
 from .misc_utils import (
