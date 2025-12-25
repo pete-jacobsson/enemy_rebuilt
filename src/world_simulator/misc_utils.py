@@ -13,6 +13,7 @@ import logging
 from typing import Dict, Any, List, Tuple
 import os
 from joblib import Parallel, delayed
+import geopandas as gpd
 
 from .topo import CoastalTaper
 
@@ -876,3 +877,206 @@ def repair_mask_artifacts(fractal_mask: np.ndarray,
 
 
 
+def rasterize_vector_to_disk(vector_source, template_raster_path, output_path, burn_value=1, all_touched=False):
+    """
+    Rasterizes a vector file (or GeoDataFrame) to a GeoTIFF matching the template's grid.
+    
+    Parameters:
+        vector_source (str or gdf): Path to vector file or existing GeoDataFrame.
+        template_raster_path (str): Path to the DEM defining the target grid/CRS.
+        output_path (str): Where to save the resulting mask.
+        burn_value (int): Value to write where polygons exist (default 1).
+        all_touched (bool): If True, all pixels touched by lines/polygons are burned. 
+                            If False (default), only pixel centers.
+    """
+    # 1. Load Vectors if path provided
+    if isinstance(vector_source, str):
+        print(f"Loading vectors from {os.path.basename(vector_source)}...")
+        gdf = gpd.read_file(vector_source)
+    else:
+        gdf = vector_source
+
+    if gdf.empty:
+        print(f"Warning: Vector source is empty. Creating blank raster at {output_path}")
+        shapes = []
+    else:
+        # Create (geometry, value) pairs
+        shapes = ((geom, burn_value) for geom in gdf.geometry)
+
+    # 2. Open Template to get Grid Specs
+    with rasterio.open(template_raster_path) as src:
+        out_shape = src.shape
+        out_transform = src.transform
+        out_crs = src.crs
+        
+    # 3. Define Output Profile (Optimized for Masks)
+    # Single band, Uint8, LZW compressed = Very small file size
+    profile = {
+        'driver': 'GTiff',
+        'height': out_shape[0],
+        'width': out_shape[1],
+        'count': 1,
+        'dtype': rasterio.uint8,
+        'crs': out_crs,
+        'transform': out_transform,
+        'nodata': 0,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 256, 
+        'blockysize': 256
+    }
+
+    # 4. Rasterize and Write
+    print(f"Rasterizing to {os.path.basename(output_path)}...")
+    
+    # We use a memory efficient approach: rasterize returns a numpy array
+    # Since your map is large (~10k x 16k), this requires ~160MB RAM per array, which is fine.
+    mask_arr = features.rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=out_transform,
+        fill=0,
+        default_value=burn_value,
+        dtype=rasterio.uint8,
+        all_touched=all_touched
+    )
+
+    # Write to disk
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(mask_arr, 1)
+        
+    print(f"Saved: {output_path}")
+
+
+
+def rasterize_variable_width_rivers(vector_source, template_raster_path, output_path, width_col='width'):
+    """
+    Rasterizes river vectors into a binary mask, using a specific column to determine 
+    the thickness of each segment.
+    
+    Parameters:
+        vector_source (str or gdf): Path to river vectors or existing GeoDataFrame.
+        template_raster_path (str): Path to DEM defining the grid.
+        output_path (str): Output filename.
+        width_col (str): Column name containing river width in meters.
+    """
+    # 1. Load Vectors
+    if isinstance(vector_source, str):
+        print(f"Loading rivers from {os.path.basename(vector_source)}...")
+        gdf = gpd.read_file(vector_source)
+    else:
+        gdf = vector_source.copy() # Copy to avoid modifying the original in memory if kept
+
+    if width_col not in gdf.columns:
+        raise ValueError(f"Column '{width_col}' not found in river data.")
+
+    # 2. Variable Buffering
+    # The geometry is a LineString (centerline). We want a polygon of specific width.
+    # Buffer radius = width / 2.
+    print("Buffering river segments by width...")
+    
+    # We buffer the geometry column directly using the width series
+    # resolution=4 gives a decent approximation of a circle without too many vertices
+    buffered_shapes = gdf.geometry.buffer(gdf[width_col] / 2, resolution=4)
+    
+    # Generator for rasterize (Geom, Value=1)
+    shapes = ((geom, 1) for geom in buffered_shapes if not geom.is_empty)
+
+    # 3. Setup Template specs
+    with rasterio.open(template_raster_path) as src:
+        out_shape = src.shape
+        out_transform = src.transform
+        out_crs = src.crs
+
+    # 4. Rasterize
+    print(f"Rasterizing variable widths to {os.path.basename(output_path)}...")
+    
+    mask_arr = features.rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=out_transform,
+        fill=0,
+        default_value=1,
+        dtype=rasterio.uint8
+    )
+
+    # 5. Write to Disk (Compressed)
+    profile = {
+        'driver': 'GTiff',
+        'height': out_shape[0],
+        'width': out_shape[1],
+        'count': 1,
+        'dtype': rasterio.uint8,
+        'crs': out_crs,
+        'transform': out_transform,
+        'nodata': 0,
+        'compress': 'lzw',
+        'tiled': True
+    }
+
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(mask_arr, 1)
+
+    print(f"Saved: {output_path}")
+
+
+def rasterize_uint8_to_disk(vector_source, template_raster_path, output_path, value_col='DN'):
+    """
+    Rasterizes a Geological Control Map (GCM) where polygon values define the Zone ID.
+    
+    Parameters:
+        vector_source (str or gdf): Path to GCM vector file or existing GeoDataFrame.
+        template_raster_path (str): Path to DEM defining the grid.
+        output_path (str): Output filename.
+        value_col (str): The column containing the Zone IDs (1-5).
+    """
+    # 1. Load Vectors
+    if isinstance(vector_source, str):
+        print(f"Loading GCM from {os.path.basename(vector_source)}...")
+        gdf = gpd.read_file(vector_source)
+    else:
+        gdf = vector_source
+
+    if value_col not in gdf.columns:
+        raise ValueError(f"Column '{value_col}' not found in GCM data.")
+
+    # 2. Prepare Shapes
+    # Create generator of (geometry, value) pairs
+    # We cast to int to ensure clean writing
+    shapes = ((geom, int(val)) for geom, val in zip(gdf.geometry, gdf[value_col]))
+
+    # 3. Setup Template specs
+    with rasterio.open(template_raster_path) as src:
+        out_shape = src.shape
+        out_transform = src.transform
+        out_crs = src.crs
+
+    # 4. Rasterize
+    print(f"Rasterizing Geological Zones (Col: {value_col}) to {os.path.basename(output_path)}...")
+    
+    mask_arr = features.rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=out_transform,
+        fill=0,             # Background/NoData
+        dtype=rasterio.uint8
+    )
+
+    # 5. Write to Disk
+    profile = {
+        'driver': 'GTiff',
+        'height': out_shape[0],
+        'width': out_shape[1],
+        'count': 1,
+        'dtype': rasterio.uint8,  # Efficient storage for values 0-255
+        'crs': out_crs,
+        'transform': out_transform,
+        'nodata': 0,
+        'compress': 'lzw',
+        'tiled': True
+    }
+
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(mask_arr, 1)
+
+    print(f"Saved: {output_path}")
