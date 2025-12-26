@@ -7,7 +7,8 @@ from .topo import (
     CoastalTaper, 
     GPUThermalEroder,
     destep_terrain,
-    apply_zone_elevation_change
+    apply_zone_elevation_change,
+    apply_constrained_tilt_optimized
 )
 
 from .misc_utils import (
