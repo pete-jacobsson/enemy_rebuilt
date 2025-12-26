@@ -759,176 +759,245 @@ def apply_zone_elevation_change(dem_array, mask_array, zone_id, elevation_change
 
 
 import numpy as np
-from scipy.ndimage import label, distance_transform_edt, generate_binary_structure, binary_dilation
+from scipy.ndimage import label, distance_transform_edt, center_of_mass
 
-def get_zone_bounds(mask, zone_id, padding=50):
+def get_south_bank_mask(gcm_crop, river_crop, target_zone_id):
     """
-    Calculates the bounding box of a specific zone with padding.
-    Returns: (min_row, max_row, min_col, max_col)
+    1. ISOLATE SOUTH BANK (VOTING STRATEGY)
+    Splits the zone by the river and identifies the Southern component 
+    by voting across multiple vertical slices.
     """
-    rows, cols = np.where(mask == zone_id)
-    if len(rows) == 0:
-        return None
+    print("  > Step 1: Isolating South Bank (Column Voting)...")
+    
+    # A. The Cut
+    zone_pixels = (gcm_crop == target_zone_id)
+    severed_zone = zone_pixels & (river_crop == 0)
+    
+    # B. Label Blobs
+    # 3x3 structure to ensure diagonal connections are caught
+    structure = np.ones((3,3), dtype=int)
+    labeled_array, num_features = label(severed_zone, structure=structure)
+    
+    if num_features < 2:
+        print(f"    ! CRITICAL WARNING: River did not sever Zone {target_zone_id}. Found only {num_features} blob.")
+        # Fallback: Return everything to avoid crash, but warn user
+        return zone_pixels
+
+    # C. The Vote: Who is South?
+    # We ignore background (0). We tally votes for "Being the Southernmost"
+    vote_tally = {i: 0 for i in range(1, num_features + 1)}
+    
+    # Define columns to sample: 20 slices across the width of the crop
+    height, width = labeled_array.shape
+    # Filter to columns that actually have data to avoid wasting checks on empty padding
+    valid_cols = np.where(np.any(labeled_array > 0, axis=0))[0]
+    
+    if len(valid_cols) == 0:
+        return zone_pixels # Should not happen if features > 0
         
-    min_r, max_r = np.min(rows), np.max(rows)
-    min_c, max_c = np.min(cols), np.max(cols)
+    # Pick 20 equidistant columns from the valid range
+    sample_columns = np.linspace(valid_cols[0], valid_cols[-1], num=20, dtype=int)
     
-    # Apply padding and clamp to array limits
-    h, w = mask.shape
-    r_start = max(0, min_r - padding)
-    r_end = min(h, max_r + padding)
-    c_start = max(0, min_c - padding)
-    c_end = min(w, max_c + padding)
+    print(f"    [Analysis] Sampling {len(sample_columns)} columns for North/South check...")
     
-    print(f"  > Calculated Crop: {r_end - r_start}x{c_end - c_start} pixels.")
-    return r_start, r_end, c_start, c_end
-
-def identify_south_bank_pixels(zone_4_slice, river_slice, anchor_slice):
-    """
-    Identifies which pixels of Zone 4 belong to the 'South Bank' (the side touching the anchor).
-    
-    Strategy:
-    1. Subtract River from Zone 4 (severing the connections).
-    2. Label resulting islands.
-    3. Find which island touches the Anchor (Southern Hills).
-    """
-    # 1. The Cut: Remove river pixels from the zone mask
-    # We use logic: Pixel is Zone 4 AND NOT River
-    severed_zone = (zone_4_slice == 1) & (river_slice == 0)
-    
-    # 2. Label Islands
-    # Use 4-connectivity (structure=[[0,1,0],[1,1,1],[0,1,0]]) to ensure diagonal rivers cut effectively
-    s = generate_binary_structure(2, 1) 
-    labeled_array, num_features = label(severed_zone, structure=s)
-    
-    print(f"  > Found {num_features} disconnected sectors in Zone 4.")
-    
-    # 3. Identify the "South" Island
-    # We look for the island that borders the Anchor (Hill) mask.
-    # Approach: Dilate the Anchor mask by 2 pixels and see which label it overlaps.
-    dilated_anchor = binary_dilation(anchor_slice, iterations=2)
-    
-    # Find labels present in the overlap zone
-    intersecting_labels = np.unique(labeled_array[dilated_anchor])
-    
-    # Filter out 0 (background)
-    valid_labels = intersecting_labels[intersecting_labels != 0]
-    
-    if len(valid_labels) == 0:
-        print("  ! Warning: No Zone 4 sector touches the Southern Anchor in this slice.")
-        return np.zeros_like(zone_4_slice, dtype=bool)
+    for col in sample_columns:
+        # Get the column slice
+        col_data = labeled_array[:, col]
         
-    # Create mask of only the touching islands
-    # usage of np.isin allows for multiple contact points if the hills are jagged
-    south_bank_mask = np.isin(labeled_array, valid_labels)
+        # Find unique labels in this column (excluding 0)
+        present_labels = np.unique(col_data)
+        present_labels = present_labels[present_labels != 0]
+        
+        # If less than 2 blobs coexist in this column, we can't compare relative height
+        if len(present_labels) < 2:
+            continue
+            
+        # For each label present, calculate its average ROW index in this column
+        # Higher Row Index = South
+        label_positions = {}
+        for lbl in present_labels:
+            # np.where returns indices where condition is true
+            rows = np.where(col_data == lbl)[0]
+            avg_row = np.mean(rows)
+            label_positions[lbl] = avg_row
+            
+        # Identify the winner for this column (The one with the Highest Row Index)
+        # max(dict, key=dict.get) gets the key with the max value
+        winner = max(label_positions, key=label_positions.get)
+        
+        vote_tally[winner] += 1
+        
+    # D. Determine Winner
+    # Find label with max votes
+    south_idx = max(vote_tally, key=vote_tally.get)
+    total_votes = sum(vote_tally.values())
     
-    return south_bank_mask
+    print(f"    [Vote Result] Winner: Blob #{south_idx} with {vote_tally[south_idx]} / {total_votes} votes.")
+    print(f"    [Tally] {vote_tally}")
 
-def compute_tilted_surface(south_bank_mask, river_slice, anchor_slice, floor, ceiling):
+    final_mask = (labeled_array == south_idx)
+
+    # --- VISUALIZATION 1: THE CUT & VOTE ---
+    plt.figure(figsize=(12, 5))
+    
+    # Plot 1: The Labeled Blobs
+    plt.subplot(1, 3, 1)
+    plt.title(f"Blobs (Winner: #{south_idx})")
+    plt.imshow(labeled_array, cmap='nipy_spectral', interpolation='nearest')
+    # Draw sample lines
+    for col in sample_columns:
+        plt.axvline(x=col, color='white', alpha=0.3, linewidth=0.5)
+        
+    # Plot 2: The Selected South Bank
+    plt.subplot(1, 3, 2)
+    plt.title("Selected South Bank")
+    plt.imshow(final_mask, cmap='gray', interpolation='nearest')
+    
+    # Plot 3: Context
+    plt.subplot(1, 3, 3)
+    plt.title("Context (River Cut)")
+    plt.imshow(river_crop, cmap='Blues', alpha=0.5)
+    plt.imshow(zone_pixels, cmap='Reds', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    # ---------------------------------------
+
+    return final_mask
+
+
+
+
+
+def compute_normalized_ramp(south_bank_mask, river_crop):
     """
-    Calculates the height ramp for the valid South Bank pixels.
+    2. CALCULATE RAMP (SHORELINE PROPAGATION)
+    Creates a 0.0 to 1.0 gradient.
+    Explicitly sets distance to 0 at the shoreline pixels to prevent cliffs.
     """
-    # 1. Distances (calculated only within the crop)
-    # Distance to River (where river_slice is True)
-    # EDT computes distance to nearest zero, so we invert logic
-    d_river = distance_transform_edt(river_slice == 0)
+    print("  > Step 2: Calculating Normalized Incline (Shoreline Propagation)...")
     
-    # Distance to Hills (where anchor_slice is True)
-    d_hill = distance_transform_edt(anchor_slice == 0)
+    # 1. Define the Sources
+    # ---------------------------------------------------------
+    # River Mask: Target the River pixels (Value > 0)
+    # in previous steps we established river_crop=0 is LAND.
+    river_mask = (river_crop != 0)
     
-    # 2. Weights (River=0.0, Hill=1.0)
-    # Protect against div/0
-    total_dist = d_river + d_hill
-    total_dist[total_dist == 0] = 1.0
+    # Boundary Mask ("The Hills"): 
+    # Defined as: Anything that is NOT South Bank AND NOT River.
+    # Logic: The zone ends where the South Bank mask ends, provided it's not the river edge.
+    hill_mask = (~south_bank_mask) & (~river_mask)
     
-    weights = d_river / total_dist
+    # 2. Identify the Contact Lines
+    # ---------------------------------------------------------
+    # Shoreline: South Bank pixels that touch the River.
+    # Dilate River to find overlap.
+    shoreline_pixels = binary_dilation(river_mask) & south_bank_mask
     
-    # 3. Ramp Calculation
-    delta = ceiling - floor
-    ramp = floor + (weights * delta)
+    # Hill-line: South Bank pixels that touch the Hills.
+    # Dilate Hills to find overlap.
+    hill_line_pixels = binary_dilation(hill_mask) & south_bank_mask
+
+    # SAFETY: If hill line is empty (e.g. crop cut off the hills?), 
+    # we default to the furthest points in the south bank mask?
+    # For now, let's assume the mask is valid.
     
-    # 4. Return masked ramp (only relevant pixels, others 0)
-    # We return the whole array, masking happens at injection time
+    # 3. Calculate Geodesic Distances
+    # ---------------------------------------------------------
+    # We want distance FROM the contact lines INTO the South Bank.
+    # edt calculates distance to the nearest Zero. 
+    # So we invert the contact masks (Contact=0, Field=1).
+    
+    # Distance from Shoreline
+    d_shore = distance_transform_edt(~shoreline_pixels)
+    
+    # Distance from Hill-line
+    d_hill = distance_transform_edt(~hill_line_pixels)
+
+    # 4. Normalize
+    # ---------------------------------------------------------
+    total_dist = d_shore + d_hill
+    
+    # Avoid div/0
+    total_dist[total_dist == 0] = 1.0 
+    
+    ramp = d_shore / total_dist
+    
+    # Mask strict output
+    ramp[~south_bank_mask] = 0.0
+    
+    # --- VISUALIZATION 3: THE RAMP ---
+    plt.figure(figsize=(18, 15))
+    plt.title("Computed Gradient (Shoreline Propagation)")
+    vis_ramp = ramp.copy()
+    vis_ramp[vis_ramp == 0] = np.nan
+    plt.imshow(vis_ramp, cmap='magma')
+    plt.colorbar(label="Incline Factor")
+    plt.show()
+    # ---------------------------------
+
     return ramp
 
-def apply_constrained_tilt_optimized(dem_array, gcm_array, throughline_mask, 
-                                     target_zone_id, anchor_zone_id, 
-                                     floor_m, ceiling_m, scale_factor=2):
+
+
+def add_ramp_to_dem(dem_crop, ramp, south_bank_mask, max_incline_m, scale_factor=2):
     """
-    Main Orchestrator:
-    1. Crops data to Zone 4 bounds (Speed).
-    2. Identifies the specific 'South Bank' sector (Topology).
-    3. Calculates tilt only for that sector.
-    4. Pastes result back to Master DEM.
+    3. INJECT
+    Adds the scaled ramp height to the existing DEM.
     """
-    print(f"--- Optimized Tilt: Zone {target_zone_id} -> Zone {anchor_zone_id} ---")
+    print(f"  > Step 3: Injecting +{max_incline_m}m Incline...")
     
-    # 1. Bounding Box Optimization
-    bounds = get_zone_bounds(gcm_array, target_zone_id)
-    if bounds is None:
-        print("Target zone empty.")
-        return dem_array
-        
-    r1, r2, c1, c2 = bounds
+    # Convert meters to units
+    max_incline_units = int(max_incline_m * scale_factor)
     
-    # 2. Extract Slices (Views)
-    # We use .copy() to ensure we don't accidentally write to the master yet
+    # Calculate elevation delta
+    # ramp is 0.0-1.0 float
+    delta_elevation = (ramp * max_incline_units).astype(np.int16)
+    
+    # Add to DEM
+    # We copy to avoid modifying source in place unexpectedly
+    modified_crop = dem_crop.copy()
+    
+    # In-place addition only on the mask
+    modified_crop[south_bank_mask] += delta_elevation[south_bank_mask]
+    
+    return modified_crop
+
+
+    
+def apply_south_bank_ramp(dem_array, gcm_array, throughline_mask, target_zone_id, incline_m, scale_factor=2):
+    """
+    4. WRAPPER
+    Orchestrates the cropping and execution.
+    """
+    print(f"--- Applying South Bank Incline (Zone {target_zone_id}) ---")
+    
+    # A. Get Bounds (Reused from previous step logic)
+    rows, cols = np.where(gcm_array == target_zone_id)
+    if len(rows) == 0: return dem_array
+    
+    pad = 50
+    r1, r2 = max(0, np.min(rows)-pad), min(gcm_array.shape[0], np.max(rows)+pad)
+    c1, c2 = max(0, np.min(cols)-pad), min(gcm_array.shape[1], np.max(cols)+pad)
+    
+    print(f"  > Crop Window: {r1}:{r2}, {c1}:{c2}")
+    
+    # B. Extract Crops
     dem_crop = dem_array[r1:r2, c1:c2]
     gcm_crop = gcm_array[r1:r2, c1:c2]
     river_crop = throughline_mask[r1:r2, c1:c2]
     
-    # 3. Define Local Boolean Masks
-    # Target Zone Mask (Local)
-    target_mask_crop = (gcm_crop == target_zone_id)
+    # C. Step 1: Get Mask
+    sb_mask = get_south_bank_mask(gcm_crop, river_crop, target_zone_id)
     
-    # Anchor Mask (Local) - Any Zone 2 pixel in the crop is a valid anchor point
-    # We assume the user has already cleaned the GCM or we filter for specific anchor blobs here if needed.
-    # Ideally, we rely on the generic zone ID for the anchor within this specific crop window.
-    anchor_mask_crop = (gcm_crop == anchor_zone_id)
+    # D. Step 2: Get Ramp
+    ramp = compute_normalized_ramp(sb_mask, river_crop)
     
-    # 4. Topological Separation (The "Cut")
-    south_bank_mask = identify_south_bank_pixels(
-        target_mask_crop, 
-        river_crop, 
-        anchor_mask_crop
-    )
+    # E. Step 3: Add to DEM
+    dem_crop_mod = add_ramp_to_dem(dem_crop, ramp, sb_mask, incline_m, scale_factor)
     
-    count = np.sum(south_bank_mask)
-    print(f"  > Identified {count} pixels for tilting (South Slope).")
-    
-    if count == 0:
-        return dem_array
-
-    # 5. Calculate Math
-    ramp_values_m = compute_tilted_surface(
-        south_bank_mask, 
-        river_crop, 
-        anchor_mask_crop, 
-        floor_m, 
-        ceiling_m
-    )
-    
-    # 6. Apply to Local DEM
-    # Convert to units
-    ramp_units = (ramp_values_m * scale_factor).astype(np.int16)
-    
-    # Create output crop
-    dem_crop_out = dem_crop.copy()
-    
-    # Update pixels:
-    # A. The South Bank gets the Ramp
-    dem_crop_out[south_bank_mask] = ramp_units[south_bank_mask]
-    
-    # B. The North Bank (Zone 4 but NOT South Bank) gets the Floor (Marsh)
-    # We identify these by: Is Zone 4 AND NOT South Bank
-    north_bank_mask = target_mask_crop & (~south_bank_mask)
-    dem_crop_out[north_bank_mask] = int(floor_m * scale_factor)
-    
-    print(f"  > Flattened {np.sum(north_bank_mask)} pixels (North Marsh).")
-    
-    # 7. Inject back into Master Array
-    # Create final copy
+    # F. Paste Back
     final_dem = dem_array.copy()
-    final_dem[r1:r2, c1:c2] = dem_crop_out
+    final_dem[r1:r2, c1:c2] = dem_crop_mod
     
     return final_dem

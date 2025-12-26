@@ -8,7 +8,7 @@ from .topo import (
     GPUThermalEroder,
     destep_terrain,
     apply_zone_elevation_change,
-    apply_constrained_tilt_optimized
+    apply_south_bank_ramp
 )
 
 from .misc_utils import (
