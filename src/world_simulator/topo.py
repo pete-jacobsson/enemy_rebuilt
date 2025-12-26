@@ -1001,3 +1001,175 @@ def apply_south_bank_ramp(dem_array, gcm_array, throughline_mask, target_zone_id
     final_dem[r1:r2, c1:c2] = dem_crop_mod
     
     return final_dem
+
+
+import numpy as np
+from scipy.ndimage import distance_transform_edt, zoom
+import gc
+from numba import njit, prange
+
+# -----------------------------------------------------------------------------
+# 1. NUMBA KERNEL (Unchanged)
+# -----------------------------------------------------------------------------
+@njit(parallel=True, fastmath=True)
+def _warp_kernel(indices_y, indices_x, width_mod, strength_mod, base_radius_px, shape):
+    """
+    Numba kernel to compute Warp Fields in a single pass.
+    Avoids creating huge temporary arrays for 'vec_x', 'vec_y', 'dist'.
+    """
+    h, w = shape
+    
+    # Pre-allocate outputs in float32 for calculation stability
+    # We cast to float16 later or return these if RAM allows
+    out_x = np.zeros((h, w), dtype=np.float32)
+    out_y = np.zeros((h, w), dtype=np.float32)
+    out_inf = np.zeros((h, w), dtype=np.float32)
+    
+    # Parallel Loop over rows
+    for r in prange(h):
+        for c in range(w):
+            # 1. Get Target Coordinates (Where the river is)
+            # EDT indices are (Row, Col)
+            target_r = indices_y[r, c]
+            target_c = indices_x[r, c]
+            
+            # 2. Vector: Target - Current
+            dy = float(target_r - r)
+            dx = float(target_c - c)
+            
+            # 3. Distance
+            dist = np.sqrt(dx*dx + dy*dy)
+            
+            # 4. Normalize Vector
+            if dist > 0:
+                norm_x = dx / dist
+                norm_y = dy / dist
+            else:
+                norm_x = 0.0
+                norm_y = 0.0
+                
+            # 5. Influence (Geology Aware)
+            # Retrieve modifiers for this pixel
+            w_mod = width_mod[r, c]
+            s_mod = strength_mod[r, c]
+            
+            # Effective Radius
+            radius = base_radius_px * w_mod
+            if radius < 0.001: radius = 0.001
+            
+            # Normalized Distance (0.0 at river -> 1.0 at edge)
+            d_norm = dist / radius
+            
+            if d_norm >= 1.0:
+                # Outside influence
+                inf = 0.0
+            else:
+                # Inside: Linear falloff -> Cubic Smoothing
+                raw_inf = 1.0 - d_norm
+                inf = raw_inf * raw_inf * (3.0 - 2.0 * raw_inf)
+            
+            out_inf[r, c] = inf
+            
+            # 6. Final Warp Vector
+            # Vector * Influence * Strength
+            mag = inf * s_mod
+            out_x[r, c] = norm_x * mag
+            out_y[r, c] = norm_y * mag
+            
+    return out_x, out_y, out_inf
+
+def compute_warp_artifacts(river_mask, geology_mask, zone_params, pixel_size_m=500.0, base_radius_km=3.0, downsample_factor=0.5):
+    """
+    Generates Hydraulic Warp artifacts with extreme optimization.
+    
+    Features:
+    1. Downsampling: Reduces RAM usage by 4x-16x during heavy EDT math.
+    2. Numba: Multithreaded, allocation-free vector math.
+    3. Float16: Output format to save disk/RAM.
+    """
+    print(f"--- Computing Warp Artifacts (Scale: {downsample_factor}) ---")
+    
+    # 1. Downsample Inputs (Critical for 4GB RAM)
+    print("  > Downsampling masks...")
+    
+    # LOGIC FIX: Perform the operation first, THEN measure the shape.
+    if downsample_factor == 0.5:
+        # Slicing is fast and RAM-efficient
+        river_small = river_mask[::2, ::2]
+        geo_small = geology_mask[::2, ::2]
+    else:
+        # Zoom handles arbitrary factors
+        river_small = zoom(river_mask, downsample_factor, order=0)
+        geo_small = zoom(geology_mask, downsample_factor, order=0)
+
+    # Capture the ACTUAL shape of the downsampled arrays
+    small_h, small_w = river_small.shape
+    orig_h, orig_w = river_mask.shape
+    
+    print(f"    Original: {orig_w}x{orig_h} -> Processed: {small_w}x{small_h}")
+
+    # 2. EDT on Small Mask
+    # 1=River in inputs (usually). We need 0=River for EDT.
+    # Safety check: if mask is mostly 0, assume 1 is river.
+    edt_input = (river_small != 1)
+    
+    print(f"  > Calculating EDT...")
+    # Return only indices to save RAM
+    _, indices = distance_transform_edt(edt_input, return_distances=True, return_indices=True)
+    
+    # 3. Prepare Geology Maps (Small)
+    print("  > Mapping Geology...")
+    # Initialize using the CORRECTED dimensions
+    width_mod = np.ones((small_h, small_w), dtype=np.float32)
+    strength_mod = np.ones((small_h, small_w), dtype=np.float32)
+    
+    for zone_id, params in zone_params.items():
+        mask = (geo_small == zone_id)
+        if np.any(mask):
+            width_mod[mask] = params['width_mod']
+            strength_mod[mask] = params['strength_mod']
+            
+    del geo_small, river_small, edt_input
+    gc.collect()
+
+    # 4. Run Numba Kernel
+    print("  > Running Numba Warp Kernel (Parallel)...")
+    
+    # Calculate effective pixel size for the downsampled grid
+    eff_pixel_size = pixel_size_m / downsample_factor
+    base_radius_px_small = (base_radius_km * 1000.0) / eff_pixel_size
+
+    # indices is (2, H, W)
+    out_x_small, out_y_small, out_inf_small = _warp_kernel(
+        indices[0], indices[1], 
+        width_mod, strength_mod, 
+        base_radius_px_small, 
+        (small_h, small_w)
+    )
+    
+    del indices, width_mod, strength_mod
+    gc.collect()
+
+    # 5. Upscale Results
+    print("  > Upscaling to full resolution...")
+    
+    # We must explicitly tell zoom the scale factor required to get back to orig_h/orig_w
+    # Because of the integer rounding, this might not be exactly 2.0
+    scale_y = orig_h / small_h
+    scale_x = orig_w / small_w
+    
+    # Upscale X
+    out_x = zoom(out_x_small, (scale_y, scale_x), order=1).astype(np.float16)
+    del out_x_small
+    
+    # Upscale Y
+    out_y = zoom(out_y_small, (scale_y, scale_x), order=1).astype(np.float16)
+    del out_y_small
+    
+    # Upscale Influence
+    out_inf = zoom(out_inf_small, (scale_y, scale_x), order=1).astype(np.float16)
+    del out_inf_small
+    
+    gc.collect()
+    
+    return out_x, out_y, out_inf
