@@ -1078,98 +1078,129 @@ def _warp_kernel(indices_y, indices_x, width_mod, strength_mod, base_radius_px, 
             
     return out_x, out_y, out_inf
 
-def compute_warp_artifacts(river_mask, geology_mask, zone_params, pixel_size_m=500.0, base_radius_km=3.0, downsample_factor=0.5):
+# -----------------------------------------------------------------------------
+# 2. HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+def _downsample_inputs(river_mask, geology_mask, factor):
     """
-    Generates Hydraulic Warp artifacts with extreme optimization.
-    
-    Features:
-    1. Downsampling: Reduces RAM usage by 4x-16x during heavy EDT math.
-    2. Numba: Multithreaded, allocation-free vector math.
-    3. Float16: Output format to save disk/RAM.
+    Downsamples masks using slicing (if 0.5) or nearest-neighbor zoom.
+    Returns the small arrays.
     """
-    print(f"--- Computing Warp Artifacts (Scale: {downsample_factor}) ---")
-    
-    # 1. Downsample Inputs (Critical for 4GB RAM)
     print("  > Downsampling masks...")
-    
-    # LOGIC FIX: Perform the operation first, THEN measure the shape.
-    if downsample_factor == 0.5:
-        # Slicing is fast and RAM-efficient
-        river_small = river_mask[::2, ::2]
-        geo_small = geology_mask[::2, ::2]
+    if factor == 0.5:
+        # Fast Slicing
+        r_small = river_mask[::2, ::2]
+        g_small = geology_mask[::2, ::2]
     else:
-        # Zoom handles arbitrary factors
-        river_small = zoom(river_mask, downsample_factor, order=0)
-        geo_small = zoom(geology_mask, downsample_factor, order=0)
+        # General Zoom
+        r_small = zoom(river_mask, factor, order=0)
+        g_small = zoom(geology_mask, factor, order=0)
+        
+    return r_small, g_small
 
-    # Capture the ACTUAL shape of the downsampled arrays
-    small_h, small_w = river_small.shape
-    orig_h, orig_w = river_mask.shape
+def _compute_edt_indices(river_mask_small):
+    """
+    Calculates Euclidean Distance Transform indices.
+    """
+    print("  > Calculating EDT...")
+    # 1=River in input -> 0=Target for EDT
+    edt_input = (river_mask_small != 1)
     
-    print(f"    Original: {orig_w}x{orig_h} -> Processed: {small_w}x{small_h}")
-
-    # 2. EDT on Small Mask
-    # 1=River in inputs (usually). We need 0=River for EDT.
-    # Safety check: if mask is mostly 0, assume 1 is river.
-    edt_input = (river_small != 1)
-    
-    print(f"  > Calculating EDT...")
     # Return only indices to save RAM
     _, indices = distance_transform_edt(edt_input, return_distances=True, return_indices=True)
-    
-    # 3. Prepare Geology Maps (Small)
+    return indices
+
+def _map_geology_modifiers(geology_small, zone_params):
+    """
+    Creates Width and Strength modifier maps based on geology zones.
+    """
     print("  > Mapping Geology...")
-    # Initialize using the CORRECTED dimensions
-    width_mod = np.ones((small_h, small_w), dtype=np.float32)
-    strength_mod = np.ones((small_h, small_w), dtype=np.float32)
+    h, w = geology_small.shape
+    width_mod = np.ones((h, w), dtype=np.float32)
+    strength_mod = np.ones((h, w), dtype=np.float32)
     
     for zone_id, params in zone_params.items():
-        mask = (geo_small == zone_id)
+        mask = (geology_small == zone_id)
         if np.any(mask):
             width_mod[mask] = params['width_mod']
             strength_mod[mask] = params['strength_mod']
             
-    del geo_small, river_small, edt_input
-    gc.collect()
+    return width_mod, strength_mod
 
-    # 4. Run Numba Kernel
-    print("  > Running Numba Warp Kernel (Parallel)...")
-    
-    # Calculate effective pixel size for the downsampled grid
-    eff_pixel_size = pixel_size_m / downsample_factor
-    base_radius_px_small = (base_radius_km * 1000.0) / eff_pixel_size
-
-    # indices is (2, H, W)
-    out_x_small, out_y_small, out_inf_small = _warp_kernel(
-        indices[0], indices[1], 
-        width_mod, strength_mod, 
-        base_radius_px_small, 
-        (small_h, small_w)
-    )
-    
-    del indices, width_mod, strength_mod
-    gc.collect()
-
-    # 5. Upscale Results
+def _upscale_results(out_x, out_y, out_inf, original_shape, small_shape):
+    """
+    Upscales the low-res results back to full resolution.
+    """
     print("  > Upscaling to full resolution...")
+    orig_h, orig_w = original_shape
+    small_h, small_w = small_shape
     
-    # We must explicitly tell zoom the scale factor required to get back to orig_h/orig_w
-    # Because of the integer rounding, this might not be exactly 2.0
+    # Calculate precise scale factors
     scale_y = orig_h / small_h
     scale_x = orig_w / small_w
     
-    # Upscale X
-    out_x = zoom(out_x_small, (scale_y, scale_x), order=1).astype(np.float16)
-    del out_x_small
+    # Zoom and cast to float16 to save RAM
+    high_x = zoom(out_x, (scale_y, scale_x), order=1).astype(np.float16)
+    high_y = zoom(out_y, (scale_y, scale_x), order=1).astype(np.float16)
+    high_inf = zoom(out_inf, (scale_y, scale_x), order=1).astype(np.float16)
     
-    # Upscale Y
-    out_y = zoom(out_y_small, (scale_y, scale_x), order=1).astype(np.float16)
-    del out_y_small
+    return high_x, high_y, high_inf
+
+# -----------------------------------------------------------------------------
+# 3. MAIN WRAPPER
+# -----------------------------------------------------------------------------
+def compute_warp_artifacts(river_mask, geology_mask, zone_params, 
+                           pixel_size_m=500.0, base_radius_km=3.0, 
+                           downsample_factor=0.5):
+    """
+    Generates Hydraulic Warp artifacts with extreme optimization.
+    Orchestrates the pipeline using helper functions.
+    """
+    print(f"--- Computing Warp Artifacts (Scale: {downsample_factor}) ---")
     
-    # Upscale Influence
-    out_inf = zoom(out_inf_small, (scale_y, scale_x), order=1).astype(np.float16)
-    del out_inf_small
+    # 1. Downsample
+    river_small, geo_small = _downsample_inputs(river_mask, geology_mask, downsample_factor)
     
+    # Capture actual dimensions for kernels and upscaling
+    small_h, small_w = river_small.shape
+    orig_h, orig_w = river_mask.shape
+    print(f"    Original: {orig_w}x{orig_h} -> Processed: {small_w}x{small_h}")
+    
+    # 2. EDT Calculation
+    indices = _compute_edt_indices(river_small)
+    
+    # 3. Geology Mapping
+    width_mod, strength_mod = _map_geology_modifiers(geo_small, zone_params)
+    
+    # Cleanup Inputs
+    del river_small, geo_small
     gc.collect()
     
-    return out_x, out_y, out_inf
+    # 4. Numba Execution
+    print("  > Running Numba Warp Kernel (Parallel)...")
+    eff_pixel_size = pixel_size_m / downsample_factor
+    base_radius_px_small = (base_radius_km * 1000.0) / eff_pixel_size
+    
+    out_x_s, out_y_s, out_inf_s = _warp_kernel(
+        indices[0], indices[1],
+        width_mod, strength_mod,
+        base_radius_px_small,
+        (small_h, small_w)
+    )
+    
+    # Cleanup Intermediate
+    del indices, width_mod, strength_mod
+    gc.collect()
+    
+    # 5. Upscale
+    final_x, final_y, final_inf = _upscale_results(
+        out_x_s, out_y_s, out_inf_s, 
+        (orig_h, orig_w), 
+        (small_h, small_w)
+    )
+    
+    # Cleanup Low Res
+    del out_x_s, out_y_s, out_inf_s
+    gc.collect()
+    
+    return final_x, final_y, final_inf
