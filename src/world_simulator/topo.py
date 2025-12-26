@@ -1204,3 +1204,115 @@ def compute_warp_artifacts(river_mask, geology_mask, zone_params,
     gc.collect()
     
     return final_x, final_y, final_inf
+
+
+
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+from numba import njit, prange
+import gc
+
+@njit(parallel=True)
+def _carve_kernel(dem_array, edt_array, geology_mask, 
+                  scour_multipliers, zone_ids, 
+                  base_cut_m, width_factor, 
+                  sea_level_units, scale_factor):
+    """
+    Fused Kernel: Scour Mapping -> Depth Calc -> Unit Scaling -> Subtraction -> Clamping.
+    """
+    h, w = dem_array.shape
+    
+    # Create output array (clone input)
+    out_dem = dem_array.copy()
+    
+    # Pre-compute scour map for fast lookup if IDs are small integers?
+    # Since zone_ids are sparse (1,2,3,4,5,9), a direct array lookup is tricky unless we map them.
+    # For speed, we can iterate simple if-checks or use a small lookup array if max ID is small.
+    # Assuming max Zone ID is < 20.
+    
+    # Parallel Loop
+    for r in prange(h):
+        for c in range(w):
+            dist = edt_array[r, c]
+            
+            # Optimization: Only process river pixels
+            if dist > 0:
+                # 1. Get Geology Scour Multiplier
+                # Linear search is fast for <10 items, or use direct lookup if possible
+                g_val = geology_mask[r, c]
+                scour_mult = 1.0 # Default
+                
+                # Fast lookup matching
+                for i in range(len(zone_ids)):
+                    if zone_ids[i] == g_val:
+                        scour_mult = scour_multipliers[i]
+                        break
+                
+                # 2. Calculate Depth in METERS
+                # Depth = (Base + (Dist * Width_Factor)) * Scour
+                depth_m = (base_cut_m + (dist * width_factor)) * scour_mult
+                
+                # 3. Convert to UNITS (1m = 2 units)
+                depth_units = int(depth_m * scale_factor)
+                
+                # 4. Apply to DEM
+                current_h = out_dem[r, c]
+                new_h = current_h - depth_units
+                
+                # 5. Safety Clamp (Sea Level)
+                if new_h < sea_level_units:
+                    new_h = sea_level_units
+                    
+                out_dem[r, c] = new_h
+                
+    return out_dem
+
+def apply_hydraulic_carve(dem_array, river_mask, geology_mask, scour_params, 
+                          base_cut_m=5.0, width_factor=2.0, sea_level_m=0.0, scale_factor=2.0):
+    """
+    Carves the river network into the DEM (Artifact B) using Numba.
+    
+    Memory Optimized: Prevents 4GB RAM overflow by avoiding intermediate float arrays.
+    """
+    print("--- Applying Hydraulic Carve (Numba Optimized) ---")
+    
+    # 1. Calculate River Depth Profile (EDT)
+    # We must do this in Scipy, but we optimize the output immediately.
+    print("  > Calculating River Depth Profile (EDT)...")
+    
+    # river_mask: 1=River. EDT calculates distance to 0 (Land).
+    # This gives distance from bank to center.
+    dist_to_bank = distance_transform_edt(river_mask).astype(np.float32)
+    
+    # 2. Prepare Numba Inputs
+    # Deconstruct dict to arrays for Numba
+    zone_ids = np.array(list(scour_params.keys()), dtype=np.int16)
+    scour_mults = np.array(list(scour_params.values()), dtype=np.float32)
+    
+    sea_level_units = int(sea_level_m * scale_factor)
+    
+    # 3. Execute Kernel
+    print("  > Executing Fused Carve Kernel...")
+    carved_dem = _carve_kernel(
+        dem_array, 
+        dist_to_bank, 
+        geology_mask,
+        scour_mults, 
+        zone_ids,
+        base_cut_m, 
+        width_factor,
+        sea_level_units,
+        scale_factor
+    )
+    
+    # Stats
+    # Diff stats
+    diff = dem_array.astype(np.float32) - carved_dem.astype(np.float32)
+    max_cut_units = np.max(diff)
+    print(f"  > Max Cut Applied: {max_cut_units} units ({max_cut_units/scale_factor:.1f}m)")
+    
+    # Cleanup
+    del dist_to_bank
+    gc.collect()
+    
+    return carved_dem

@@ -9,7 +9,8 @@ from .topo import (
     destep_terrain,
     apply_zone_elevation_change,
     apply_south_bank_ramp,
-    compute_warp_artifacts
+    compute_warp_artifacts,
+    apply_hydraulic_carve
 )
 
 from .misc_utils import (
