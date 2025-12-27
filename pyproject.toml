@@ -3,11 +3,11 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "world_simulator"
-version = "0.1.0"
-description = "A geospatial toolkit for converting river polygons to centerlines on the WFRP world."
+name = "pyworldsim"
+version = "0.2.0"
+description = "A geospatial toolkit for worldbuilding"
 authors = [
-  { name="Your Name", email="your.email@example.com" },
+  { name="Your Name", email="jacobsson@o2.pl" },
 ]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -30,4 +30,4 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/wfrp_rivers"
+"Homepage" = "https://github.com/pete-jacobsson/enemy_rebuilt"

@@ -1080,3 +1080,17 @@ def rasterize_uint8_to_disk(vector_source, template_raster_path, output_path, va
         dst.write(mask_arr, 1)
 
     print(f"Saved: {output_path}")
+
+
+
+# Helper to save snapshots
+def save_snapshot(filename, data, profile):
+    out_path = os.path.join(WD, "source_rasters", filename)
+    print(f"  > Saving snapshot: {filename}...")
+    # Round to int16 for storage efficiency, keep float32 in memory
+    save_data = np.round(data).astype(np.int16)
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(save_data, 1)
+
+# Initialize the Engine (Placeholder for the class we will build)
+# engine = TerrainEngine(shape=dem_accumulator.shape)

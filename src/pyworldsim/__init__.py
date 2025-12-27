@@ -23,9 +23,10 @@ from .misc_utils import (
     MeasureFractalDimension, 
     rasterize_vector_to_disk,
     rasterize_variable_width_rivers,
-    rasterize_uint8_to_disk)
+    rasterize_uint8_to_disk
+)
 
-from .terrain_engine import CoordinateEngine
+from .terrain_engine import TerrainEngine
 
 from .layers import (
     TerrainLayer, 
