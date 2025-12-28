@@ -104,6 +104,12 @@ class WorldState:
             if os.path.exists(full_path):
                 # Load with Geopandas
                 gdf = gpd.read_file(full_path)
+
+                # --- FIX START: CRS Safety Check ---
+                if gdf.crs is None:
+                    print(f"  ! WARNING: {key} has NO defined CRS. Assuming match with simulation ({self.crs}).")
+                    gdf.set_crs(self.crs, allow_override=True, inplace=True)
+                # --- FIX END ---
                 
                 # Ensure CRS matches the simulation grid
                 if gdf.crs != self.crs:
@@ -116,17 +122,18 @@ class WorldState:
                 print(f"  ! WARNING: Vector file not found: {full_path}")
 
     
-    def save_checkpoint(self, name):
+    def save_state(self, filepath):
         """
         Serializes the current state (Elevation + Lithology + Active Layers) 
         to a compressed .npz file.
         
+        Renamed from 'save_checkpoint' to match the 'load_or_run' interface.
+        
         Args:
-            name (str): Filename identifier (e.g., '01_initialization').
+            filepath (str): The full destination path for the .npz file.
         """
-        cp_dir = self.config["paths"]["checkpoints"]
-        os.makedirs(cp_dir, exist_ok=True)
-        filepath = os.path.join(cp_dir, f"{name}.npz")
+        # Ensure the directory exists (just in case)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
         # Gather all arrays into a dictionary
         # We explicitly save the primary attributes
@@ -140,7 +147,7 @@ class WorldState:
         # Add any dynamic layers
         arrays_to_save.update(self.layers)
         
-        print(f"Saving checkpoint to {filepath}...")
+        print(f"Saving state to {filepath}...")
         np.savez_compressed(filepath, **arrays_to_save)
         print("  > Save complete.")
 
