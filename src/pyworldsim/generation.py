@@ -204,25 +204,201 @@ class PrimordialSeabed:
 
 import rasterio.features
 import numpy as np
+import geopandas as gpd
+from shapely.geometry import LineString
+from dataclasses import dataclass
+from typing import List, Tuple
 
-
-
+@dataclass
+class Spine:
+    """
+    Lightweight data container for a single mountain ridge segment.
+    Using a dataclass for memory efficiency and type hinting.
+    """
+    geometry: LineString
+    epoch: int
+    base_amplitude: float
+    width_limit: float
+    generation: int
+    # Add an ID or parent_id here if we need to trace lineage later
+    
 class OrogenySpineGenerator:
     """
-    Bare Metal implementation.
-    Rasterizes the raw input tectonic axes from a single source layer 
-    by filtering on the 'oe_epoch' column.
+    Generates a fractal network of mountain spines (ridges) from input tectonic axes.
+    
+    This class operates strictly on vector geometry (LineStrings). It implements a 
+    recursive growth algorithm where main axes are roughened (fractalized) and then 
+    sprout orthogonal 'spurs', which in turn roughen and sprout their own spurs.
     """
     def __init__(self, ctx):
         self.ctx = ctx
         self.config = ctx.config.get("orogeny", {})
         self.generated_spines = [] 
 
-    def generate_structural_vectors(self):
+
+    def run(self, generations: int = 3, roughness: float = 0.5):
         """
-        PLACEHOLDER: Skipping fractal spine generation.
+        Public entry point. Orchestrates the full generation pipeline.
+        
+        Args:
+            generations (int): How many levels of recursion (0=Main, 1=Spurs, 2=Sub-spurs).
+            roughness (float): Magnitude of the fractal displacement.
         """
-        print("  > [Bare Metal] Skipping fractal spine generation...")
+        # 1. Load initial axes
+        self._ingest()
+        
+        # 2. Recursive Growth
+        current_generation_spines = [s for s in self.active_pool if s.generation == 0]
+        
+        for i in range(generations):
+            # Pass the specific roughness and current iteration index to the loop
+            current_generation_spines = self._execute_growth_loop(
+                current_generation_spines, 
+                roughness, 
+                current_gen_index=i
+            )
+            
+        # 3. Final Polish (Fractalize the tips which haven't been processed yet)
+        # The loop fractalizes parents before they spawn. The last generation 
+        # never became parents, so we give them one pass now.
+        for spine in current_generation_spines:
+            spine.geometry = self._fractalize_geometry(spine.geometry, roughness)
+            
+        # 4. Save
+        self._sink_to_gpkg()
+
+    def _ingest(self):
+        """
+        Loads the 'orogeny_axes' layer from the context.
+        
+        actions:
+            1. Iterates through GeoDataFrame rows.
+            2. Extracts 'oe_epoch', 'amplitude', 'width_km'.
+            3. Converts geometry to Generation 0 Spine objects.
+            4. Populates self.active_pool.
+        """
+        pass
+
+    def _execute_growth_loop(self, parents: List[Spine], roughness: float, current_gen_index: int) -> List[Spine]:
+        """
+        Wrapper for a single generation cycle.
+        
+        Args:
+            parents (List[Spine]): The spines from the previous generation.
+            roughness (float): Displacement factor.
+            current_gen_index (int): The current generation number (0, 1, etc).
+            
+        Returns:
+            List[Spine]: The newly created children (Generation N+1).
+            
+        Logic:
+            1. Iterate through 'parents'.
+            2. Call _fractalize_geometry() on the parent (in-place modification).
+            3. Determine how many spurs to spawn (density).
+            4. Loop through spur count:
+               a. _select_spur_location
+               b. _project_spur
+               c. _orient_spur
+               d. _spur_length
+               e. _inherit
+               f. _add_to_pool
+            5. Return the list of new children.
+        """
+        pass
+
+    def _fractalize_geometry(self, geometry: LineString, roughness: float) -> LineString:
+        """
+        Executes Step A: Fractalization (1D Midpoint Displacement).
+        
+        To optimize for speed, this should use numpy vectorization rather than 
+        iterating through points in pure Python if possible.
+        
+        Args:
+            geometry (LineString): The straight(er) input line.
+            roughness (float): Displacement scale relative to segment length.
+            
+        Returns:
+            LineString: A higher-resolution, jagged line.
+        """
+        pass
+
+    def _select_spur_location(self, parent_geo: LineString) -> Tuple[float, float, float]:
+        """
+        Selects a point along the parent spine to sprout a child.
+        
+        Returns:
+            (x, y, tangent_angle): The coords and the local angle of the parent line 
+                                   at that point (needed for projection).
+        """
+        pass
+
+    def _project_spur(self, x: float, y: float, tangent_angle: float, length: float) -> LineString:
+        """
+        Calculates the geometry of the new spur.
+        
+        Logic:
+            1. Calculate Normal vector (tangent + 90 degrees).
+            2. Create a straight line from (x,y) along the Normal for 'length' meters.
+            
+        Note: The spur starts straight. It will be fractalized in the *next* generation loop when it becomes a parent.
+        """
+        pass
+
+    def _orient_spur(self, tangent_angle: float) -> float:
+        """
+        Determines the directionality of the spur (Left vs Right).
+        
+        Logic:
+            Randomly chooses +90 or -90 degrees offset from tangent.
+            May also add slight random jitter (+/- 15 deg) so spurs aren't perfectly orthogonal.
+        """
+        pass
+
+    def _spur_length(self, parent_width: float, current_gen: int) -> float:
+        """
+        Calculates how long the new spur should be.
+        
+        Logic:
+            Length should decay with generations.
+            e.g. Gen 1 = 50% of parent width. Gen 2 = 25% of parent width.
+        """
+        pass
+
+    def _inherit(self, parent: Spine, new_geometry: LineString) -> Spine:
+        """
+        Creates the new Child Spine object.
+        
+        Args:
+            parent (Spine): The source of genetic metadata (Epoch, Amp).
+            new_geometry (LineString): The projected line.
+            
+        Returns:
+            Spine: The initialized child object with Gen = Parent.Gen + 1.
+        """
+        pass
+
+    def _add_to_pool(self, new_spine: Spine, child_list: List[Spine]):
+        """
+        Standardizes adding new items to data structures.
+        
+        Args:
+            new_spine (Spine): The object to store.
+            child_list (List): The temporary list for the current loop iteration.
+            
+        Side Effect:
+            Adds to self.active_pool (Master record) AND child_list (Iteration record).
+        """
+        pass
+
+    def _sink_to_gpkg(self):
+        """
+        Export handling.
+        
+        Actions:
+            1. Convert self.active_pool (List[Spine]) to a GeoDataFrame.
+            2. Save to temporary storage or output path defined in Config.
+            3. Log summary stats (e.g. "Generated 4500 ridge segments").
+        """
         pass
 
     def rasterize_structure(self):
