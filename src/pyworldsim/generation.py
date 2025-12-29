@@ -232,52 +232,88 @@ class OrogenySpineGenerator:
     """
     def __init__(self, ctx):
         self.ctx = ctx
-        self.config = ctx.config.get("orogeny", {})
-        self.generated_spines = [] 
+        # self.config = ctx.config.get("orogeny", {})
+        self.active_pool: List[Spine] = [] 
 
 
-    def run(self, generations: int = 3, roughness: float = 0.5):
+    def generate_structural_vectors(self, generations: int = 3, roughness: float = 0.5):
         """
         Public entry point. Orchestrates the full generation pipeline.
+        Renamed from 'run' to be more descriptive.
         
         Args:
             generations (int): How many levels of recursion (0=Main, 1=Spurs, 2=Sub-spurs).
             roughness (float): Magnitude of the fractal displacement.
         """
-        # 1. Load initial axes
+        # 1. Load Gen 0 (The Canonical Axes) from the context
+        # These are currently straight lines from the GIS vector tool.
         self._ingest()
         
-        # 2. Recursive Growth
+        # 2. Prepare Gen 0: Fractalize the Inputs
+        # The user's input vectors are too smooth. We must roughen them *before* # starting the growth loop so that spurs branch off a jagged line, not a straight one.
+        # (We only apply this to the initial inputs here).
+        for spine in self.active_pool:
+            if spine.generation == 0:
+                spine.geometry = self._fractalize_geometry(spine.geometry, roughness)
+
+        # 3. Recursive Growth Loop
+        # We start with the Gen 0 parents we just loaded and roughened.
         current_generation_spines = [s for s in self.active_pool if s.generation == 0]
         
         for i in range(generations):
-            # Pass the specific roughness and current iteration index to the loop
-            current_generation_spines = self._execute_growth_loop(
-                current_generation_spines, 
-                roughness, 
+            # Pass the current generation index to logic
+            # Note: We are NOT fractalizing the new spurs inside this loop yet.
+            # They will be generated as straight lines for structural verification.
+            new_children = self._execute_growth_loop(
+                parents=current_generation_spines, 
+                roughness=roughness, 
                 current_gen_index=i
             )
             
-        # 3. Final Polish (Fractalize the tips which haven't been processed yet)
-        # The loop fractalizes parents before they spawn. The last generation 
-        # never became parents, so we give them one pass now.
-        for spine in current_generation_spines:
-            spine.geometry = self._fractalize_geometry(spine.geometry, roughness)
+            # The children become the parents for the next iteration
+            current_generation_spines = new_children
             
-        # 4. Save
+        # 4. Save result to disk
         self._sink_to_gpkg()
 
+    
+    
     def _ingest(self):
         """
         Loads the 'orogeny_axes' layer from the context.
         
-        actions:
+        Actions:
             1. Iterates through GeoDataFrame rows.
             2. Extracts 'oe_epoch', 'amplitude', 'width_km'.
             3. Converts geometry to Generation 0 Spine objects.
             4. Populates self.active_pool.
         """
-        pass
+        # Validate existence of layer
+        if 'orogeny' not in self.ctx.vectors:
+            print("Warning: 'orogeny' layer not found in context.")
+            return
+
+        gdf = self.ctx.vectors['orogeny']
+        required_cols = {'oe_epoch': 1, 'amplitude': 1000.0, 'width_km': 10.0}
+        
+        # Ensure cols exist
+        for col, val in required_cols.items():
+            if col not in gdf.columns: gdf[col] = val
+
+        new_spines = []
+        for _, row in gdf.iterrows():
+            geoms = [row.geometry] if row.geometry.geom_type == 'LineString' else list(row.geometry.geoms)
+            for geom in geoms:
+                new_spines.append(Spine(
+                    geometry=geom,
+                    epoch=int(row['oe_epoch']),
+                    base_amplitude=float(row['amplitude']),
+                    width_limit=float(row['width_km']),
+                    generation=0
+                ))
+        
+        self.active_pool.extend(new_spines)
+        print(f"  > Ingested {len(new_spines)} tectonic axes.")
 
     def _execute_growth_loop(self, parents: List[Spine], roughness: float, current_gen_index: int) -> List[Spine]:
         """
@@ -306,22 +342,52 @@ class OrogenySpineGenerator:
         """
         pass
 
+    
+        
     def _fractalize_geometry(self, geometry: LineString, roughness: float) -> LineString:
         """
         Executes Step A: Fractalization (1D Midpoint Displacement).
         
-        To optimize for speed, this should use numpy vectorization rather than 
-        iterating through points in pure Python if possible.
+        Engineered for speed:
+        - Uses NumPy vectorization instead of Python loops.
+        - Optimization: Avoids Sqrt() calls. 
+          Standard Midpoint Displacement: Offset = Unit_Normal * Length * Roughness * Random
+          Optimization: Offset = Perpendicular_Vector * Roughness * Random
+          (Since Perpendicular_Vector magnitude IS Length, they cancel out).
         
         Args:
-            geometry (LineString): The straight(er) input line.
+            geometry (LineString): The input line.
             roughness (float): Displacement scale relative to segment length.
             
         Returns:
-            LineString: A higher-resolution, jagged line.
+            LineString: A subdivided, jagged line (2N - 1 points).
         """
-        pass
+        coords = np.array(geometry.coords)
+        if len(coords) < 2: return geometry
 
+        vectors = coords[1:] - coords[:-1]
+        midpoints = (coords[:-1] + coords[1:]) * 0.5
+        
+        # Perpendiculars (-y, x)
+        perp = np.empty_like(vectors)
+        perp[:, 0] = -vectors[:, 1]
+        perp[:, 1] = vectors[:, 0]
+        
+        rng = np.random.uniform(-1.0, 1.0, size=(len(vectors), 1))
+        
+        # Displacement
+        displaced_mids = midpoints + (perp * (roughness * rng))
+        
+        # Interleave
+        new_count = len(coords) + len(displaced_mids)
+        result = np.empty((new_count, 2), dtype=coords.dtype)
+        result[0::2] = coords
+        result[1::2] = displaced_mids
+        
+        return LineString(result)
+        return LineString(result_coords)
+
+    
     def _select_spur_location(self, parent_geo: LineString) -> Tuple[float, float, float]:
         """
         Selects a point along the parent spine to sprout a child.
@@ -401,70 +467,49 @@ class OrogenySpineGenerator:
         """
         pass
 
-    def rasterize_structure(self):
+    def rasterize_structure(self, layer_name: str = "debug_spines"):
         """
-        Creates the 'skeleton_mask' layer.
-        Burns pixel values matching the Orogeny Epoch:
-        - 1: OE1 (World's Edge / Youngest / Highest)
-        - 2: OE2 (Middle Mountains)
-        - 3: OE3 (Old Roots)
+        Rasterizes the generated vectors into the WorldState for visual review.
+        
+        Encodes 'Generation' into pixel brightness:
+        - Gen 0 (Main Axis): 255
+        - Gen 1 (Spurs): 180
+        - Gen 2 (Sub-spurs): 100
+        
+        Args:
+            layer_name (str): The key to store the resulting array in ctx.layers.
         """
-        
-        print("  > Rasterizing tectonic axes (Skeleton Mask)...")
-        
-        # 1. Initialize empty mask
-        shape = self.ctx.shape
-        mask = np.zeros(shape, dtype=np.uint8)
-        
-        # 2. Get the vector layer
-        orogeny_gdf = self.ctx.vectors.get("orogeny")
-        if orogeny_gdf is None:
-             orogeny_gdf = self.ctx.vectors.get("orogeny_axes")
-             
-        if orogeny_gdf is None:
-            print("    ! Warning: No 'orogeny' layer found.")
-            self.ctx.layers["skeleton_mask"] = mask 
+        if not self.active_pool:
+            print("Warning: No spines to rasterize. Run generate_structural_vectors() first.")
             return
 
-        print(f"    - Processing source layer ({len(orogeny_gdf)} features)")
-        
-        # 3. Prepare Shapes with Values
-        # We want to burn tuples of (geometry, value)
-        pixel_size = self.ctx.config["resolution"]["sim_pixel_size"]
-        buffer_width = 3 * pixel_size # 1500m wide for visibility
-        
-        shapes_to_burn = []
-        
-        if 'oe_epoch' not in orogeny_gdf.columns:
-            print("    ! Warning: 'oe_epoch' column missing. Defaulting to ID 1.")
-            val = 1
-            for geom in orogeny_gdf.geometry:
-                if geom: shapes_to_burn.append((geom.buffer(buffer_width), val))
-        else:
-            # Iterate rows to get specific epoch per feature
-            # Filter for valid epochs only
-            valid_rows = orogeny_gdf[orogeny_gdf['oe_epoch'].isin([1, 2, 3])]
-            print(f"    - Found {len(valid_rows)} valid axes (Epochs 1-3).")
-            
-            for _, row in valid_rows.iterrows():
-                if row.geometry:
-                    val = int(row['oe_epoch']) # Burn 1, 2, or 3
-                    shapes_to_burn.append((row.geometry.buffer(buffer_width), val))
-        
-        # 4. Burn
-        if shapes_to_burn:
-            rasterio.features.rasterize(
-                shapes=shapes_to_burn,
-                out_shape=shape,
-                transform=self.ctx.transform,
-                out=mask,
-                dtype=np.uint8
-                # Note: We do NOT set default_value here, because the value comes from the shapes list
-            )
-            
-        # 5. Save
-        self.ctx.layers["skeleton_mask"] = mask
-        print("  > Skeleton mask created (Multi-Epoch).")
+        print(f"Rasterizing {len(self.active_pool)} spines to layer '{layer_name}'...")
+
+        # 1. Define Value Mapping based on Generation
+        # (Gen 0 is brightest, Gen N is dimmer)
+        gen_brightness = {0: 255, 1: 180, 2: 100, 3: 50}
+
+        # 2. Prepare shapes for rasterio
+        # Format: list of (geometry, value) tuples
+        shapes = []
+        for spine in self.active_pool:
+            pixel_val = gen_brightness.get(spine.generation, 50)
+            shapes.append((spine.geometry, pixel_val))
+
+        # 3. Rasterize
+        # all_touched=True ensures thin lines are drawn even if they don't cover center of pixel
+        raster = rasterio.features.rasterize(
+            shapes=shapes,
+            out_shape=self.ctx.shape,
+            transform=self.ctx.transform,
+            fill=0,
+            all_touched=True, 
+            dtype=np.uint8
+        )
+
+        # 4. Store in Context
+        self.ctx.layers[layer_name] = raster
+        print(f"  > Layer '{layer_name}' created.")
 
 
 
