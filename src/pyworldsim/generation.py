@@ -236,44 +236,48 @@ class OrogenySpineGenerator:
         self.active_pool: List[Spine] = [] 
 
 
-    def generate_structural_vectors(self, generations: int = 3, roughness: float = 0.5):
+    def generate_structural_vectors(self, 
+                                    generations: int = 3, 
+                                    roughness: float = 0.5,
+                                    resolution: float = 2.0, 
+                                    deflection_scale: float = 40.0,
+                                    spur_interval: float = 20.0,
+                                    spur_length_max: float = 50.0):
         """
         Public entry point. Orchestrates the full generation pipeline.
-        Renamed from 'run' to be more descriptive.
-        
-        Args:
-            generations (int): How many levels of recursion (0=Main, 1=Spurs, 2=Sub-spurs).
-            roughness (float): Magnitude of the fractal displacement.
         """
-        # 1. Load Gen 0 (The Canonical Axes) from the context
-        # These are currently straight lines from the GIS vector tool.
+        # 1. Reset Pool
+        self.active_pool = []
+
+        # 2. Load Gen 0
         self._ingest()
-        
-        # 2. Prepare Gen 0: Fractalize the Inputs
-        # The user's input vectors are too smooth. We must roughen them *before* # starting the growth loop so that spurs branch off a jagged line, not a straight one.
-        # (We only apply this to the initial inputs here).
+        if not self.active_pool: return
+
+        # 3. Prepare Gen 0 (Fractalize Initial Inputs)
+        print(f"Fractalizing {len(self.active_pool)} initial axes...")
         for spine in self.active_pool:
             if spine.generation == 0:
-                spine.geometry = self._fractalize_geometry(spine.geometry, roughness)
+                spine.geometry = self._fractalize_geometry(
+                    spine.geometry, roughness, resolution, deflection_scale
+                )
 
-        # 3. Recursive Growth Loop
-        # We start with the Gen 0 parents we just loaded and roughened.
+        # 4. Recursive Growth Loop
         current_generation_spines = [s for s in self.active_pool if s.generation == 0]
         
+        print(f"Starting Growth Loop for {generations} generations...")
         for i in range(generations):
-            # Pass the current generation index to logic
-            # Note: We are NOT fractalizing the new spurs inside this loop yet.
-            # They will be generated as straight lines for structural verification.
             new_children = self._execute_growth_loop(
                 parents=current_generation_spines, 
                 roughness=roughness, 
+                resolution=resolution,
+                deflection_scale=deflection_scale,
+                spur_interval=spur_interval,
+                spur_length_max=spur_length_max,
                 current_gen_index=i
             )
-            
-            # The children become the parents for the next iteration
             current_generation_spines = new_children
             
-        # 4. Save result to disk
+        # 5. Save result
         self._sink_to_gpkg()
 
     
@@ -315,78 +319,299 @@ class OrogenySpineGenerator:
         self.active_pool.extend(new_spines)
         print(f"  > Ingested {len(new_spines)} tectonic axes.")
 
-    def _execute_growth_loop(self, parents: List[Spine], roughness: float, current_gen_index: int) -> List[Spine]:
+    def _execute_growth_loop(self, 
+                             parents: List[Spine], 
+                             roughness: float,
+                             resolution: float,
+                             deflection_scale: float,
+                             spur_interval: float,
+                             spur_length_max: float,
+                             current_gen_index: int) -> List[Spine]:
         """
-        Wrapper for a single generation cycle.
+        Spawns orthogonal child spurs from parent spines.
+        """
+        new_children = []
         
-        Args:
-            parents (List[Spine]): The spines from the previous generation.
-            roughness (float): Displacement factor.
-            current_gen_index (int): The current generation number (0, 1, etc).
+        # Decay factors for each generation (spurs get smaller and shorter)
+        # Gen 0->1: 100% length. Gen 1->2: 60% length.
+        length_decay = 0.6 ** (current_gen_index + 1)
+        
+        # Amplitude decay: Spurs are less "rough/tall" than parents
+        child_amp_factor = 0.7 
+
+        for parent in parents:
+            # 1. Fractalize Parent BEFORE spawning 
+            # (Note: Gen 0 was already fractalized in main method, but Gen 1+ need it here)
+            if current_gen_index > 0:
+                parent.geometry = self._fractalize_geometry(
+                    parent.geometry, roughness, resolution, deflection_scale
+                )
+
+            # 2. Analyze Parent Geometry for Spawn Points
+            # We walk along the line segments to place spurs at fixed intervals
+            coords = np.array(parent.geometry.coords)
+            total_len = parent.geometry.length
             
-        Returns:
-            List[Spine]: The newly created children (Generation N+1).
+            # If parent is too short to have spurs, skip
+            if total_len < spur_interval:
+                continue
+
+            # Calculate number of spurs based on interval
+            num_spurs = int(total_len / spur_interval)
             
-        Logic:
-            1. Iterate through 'parents'.
-            2. Call _fractalize_geometry() on the parent (in-place modification).
-            3. Determine how many spurs to spawn (density).
-            4. Loop through spur count:
-               a. _select_spur_location
-               b. _project_spur
-               c. _orient_spur
-               d. _spur_length
-               e. _inherit
-               f. _add_to_pool
-            5. Return the list of new children.
-        """
-        pass
+            # We select points by distance along the linestring
+            # Logic: Interpolate positions along the complex fractal path
+            distances = np.linspace(spur_interval, total_len - spur_interval, num_spurs)
+            
+            # --- Vectorized Spur Generation ---
+            
+            # A. Get flattened arrays for interpolation
+            deltas = coords[1:] - coords[:-1]
+            seg_lengths = np.linalg.norm(deltas, axis=1)
+            cumulative_dist = np.concatenate(([0], np.cumsum(seg_lengths)))
+            
+            # B. Interpolate Locations (X, Y)
+            spur_xs = np.interp(distances, cumulative_dist, coords[:, 0])
+            spur_ys = np.interp(distances, cumulative_dist, coords[:, 1])
+            
+            # C. Interpolate Tangents (approximate by looking slightly ahead)
+            # We re-interpolate slightly further along to get the local vector
+            lookahead_dist = np.minimum(distances + 5.0, total_len)
+            next_xs = np.interp(lookahead_dist, cumulative_dist, coords[:, 0])
+            next_ys = np.interp(lookahead_dist, cumulative_dist, coords[:, 1])
+            
+            tangent_dx = next_xs - spur_xs
+            tangent_dy = next_ys - spur_ys
+            
+            # Normalize tangents
+            mags = np.hypot(tangent_dx, tangent_dy)
+            mags[mags == 0] = 1.0
+            tangent_dx /= mags
+            tangent_dy /= mags
+            
+            # D. Calculate Normals (Rotated 90 degrees: -y, x)
+            normal_dx = -tangent_dy
+            normal_dy = tangent_dx
+            
+            # E. Generate Children
+            for k in range(len(distances)):
+                # Randomize orientation (Left vs Right side of ridge)
+                side = 1 if np.random.random() > 0.5 else -1
+                
+                # Jitter the angle slightly (max +/- 30 degrees) so it's not perfectly grid-like
+                angle_jitter = np.radians(np.random.uniform(-30, 30))
+                cos_a, sin_a = np.cos(angle_jitter), np.sin(angle_jitter)
+                
+                # Rotate normal vector
+                nx = normal_dx[k] * cos_a - normal_dy[k] * sin_a
+                ny = normal_dx[k] * sin_a + normal_dy[k] * cos_a
+                
+                # Determine Length
+                # Base Max * Decay * Random Variation (0.5 - 1.0)
+                this_length = spur_length_max * length_decay * np.random.uniform(0.5, 1.0)
+                
+                # Project End Point
+                start_pt = np.array([spur_xs[k], spur_ys[k]])
+                end_pt = start_pt + (np.array([nx, ny]) * side * this_length)
+                
+                # Create straight line (will be fractalized next generation or at end)
+                child_geom = LineString([start_pt, end_pt])
+                
+                # Inherit & Create Object
+                child = Spine(
+                    geometry=child_geom,
+                    epoch=parent.epoch,
+                    base_amplitude=parent.base_amplitude * child_amp_factor,
+                    width_limit=parent.width_limit * 0.5,
+                    generation=parent.generation + 1
+                )
+                
+                new_children.append(child)
+        
+        # Add all new children to the main active pool
+        self.active_pool.extend(new_children)
+        
+        return new_children
 
     
         
-    def _fractalize_geometry(self, geometry: LineString, roughness: float) -> LineString:
-        """
-        Executes Step A: Fractalization (1D Midpoint Displacement).
+    # def _fractalize_geometry(self, geometry: LineString, roughness: float) -> LineString:
+    #     """
+    #     Executes Step A: Fractalization (1D Midpoint Displacement).
         
-        Engineered for speed:
-        - Uses NumPy vectorization instead of Python loops.
-        - Optimization: Avoids Sqrt() calls. 
-          Standard Midpoint Displacement: Offset = Unit_Normal * Length * Roughness * Random
-          Optimization: Offset = Perpendicular_Vector * Roughness * Random
-          (Since Perpendicular_Vector magnitude IS Length, they cancel out).
+    #     Engineered for speed:
+    #     - Uses NumPy vectorization instead of Python loops.
+    #     - Optimization: Avoids Sqrt() calls. 
+    #       Standard Midpoint Displacement: Offset = Unit_Normal * Length * Roughness * Random
+    #       Optimization: Offset = Perpendicular_Vector * Roughness * Random
+    #       (Since Perpendicular_Vector magnitude IS Length, they cancel out).
         
-        Args:
-            geometry (LineString): The input line.
-            roughness (float): Displacement scale relative to segment length.
+    #     Args:
+    #         geometry (LineString): The input line.
+    #         roughness (float): Displacement scale relative to segment length.
             
-        Returns:
-            LineString: A subdivided, jagged line (2N - 1 points).
+    #     Returns:
+    #         LineString: A subdivided, jagged line (2N - 1 points).
+    #     """
+    #     coords = np.array(geometry.coords)
+    #     if len(coords) < 2: return geometry
+
+    #     vectors = coords[1:] - coords[:-1]
+    #     midpoints = (coords[:-1] + coords[1:]) * 0.5
+        
+    #     # Perpendiculars (-y, x)
+    #     perp = np.empty_like(vectors)
+    #     perp[:, 0] = -vectors[:, 1]
+    #     perp[:, 1] = vectors[:, 0]
+        
+    #     rng = np.random.uniform(-1.0, 1.0, size=(len(vectors), 1))
+        
+    #     # Displacement
+    #     displaced_mids = midpoints + (perp * (roughness * rng))
+        
+    #     # Interleave
+    #     new_count = len(coords) + len(displaced_mids)
+    #     result = np.empty((new_count, 2), dtype=coords.dtype)
+    #     result[0::2] = coords
+    #     result[1::2] = displaced_mids
+        
+    #     return LineString(result)
+    #     return LineString(result_coords)
+
+    # def _fractalize_geometry(self, 
+    #                          geometry: LineString, 
+    #                          roughness: float, 
+    #                          resolution: float, 
+    #                          deflection_scale: float) -> LineString:
+    #     """
+    #     Fractalizes a line using Spectral Normal Displacement (Resample + Sine Sum).
+        
+    #     Args:
+    #         geometry: Input LineString.
+    #         roughness: 0.0-1.0 noise multiplier.
+    #         resolution: Distance in pixels between resampling points.
+    #         deflection_scale: Base physical amplitude in pixels.
+    #     """
+    #     # 1. Resample to dense points based on 'resolution'
+    #     total_length = geometry.length
+    #     if total_length < resolution:
+    #         return geometry
+            
+    #     # Determine number of segments based on desired resolution
+    #     num_points = int(total_length / resolution)
+        
+    #     # --- Vectorized Resampling ---
+    #     original_coords = np.array(geometry.coords)
+        
+    #     deltas = original_coords[1:] - original_coords[:-1]
+    #     seg_lengths = np.linalg.norm(deltas, axis=1)
+    #     cumulative_dist = np.concatenate(([0], np.cumsum(seg_lengths)))
+        
+    #     new_distances = np.linspace(0, cumulative_dist[-1], num_points)
+        
+    #     new_x = np.interp(new_distances, cumulative_dist, original_coords[:, 0])
+    #     new_y = np.interp(new_distances, cumulative_dist, original_coords[:, 1])
+        
+    #     dense_coords = np.column_stack((new_x, new_y))
+        
+    #     # 2. Calculate Normals
+    #     padded = np.pad(dense_coords, ((1, 1), (0, 0)), mode='edge')
+    #     tangents = padded[2:] - padded[:-2]
+        
+    #     norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    #     norms[norms == 0] = 1 
+    #     tangents /= norms
+        
+    #     normals = np.empty_like(tangents)
+    #     normals[:, 0] = -tangents[:, 1]
+    #     normals[:, 1] = tangents[:, 0]
+        
+    #     # 3. Spectral Synthesis
+    #     # Base amplitude calculation: Roughness * Deflection Scale
+    #     base_amp = roughness * deflection_scale 
+        
+    #     freqs = [0.01, 0.02, 0.05, 0.1]
+    #     amps  = [1.0,  0.5,  0.3,  0.1]
+    #     phases = np.random.rand(len(freqs)) * 2 * np.pi
+        
+    #     displacement = np.zeros(num_points)
+        
+    #     for f, a, p in zip(freqs, amps, phases):
+    #         displacement += np.sin(new_distances * f + p) * (base_amp * a)
+            
+    #     # 4. Apply Displacement
+    #     displacement = displacement.reshape(-1, 1)
+    #     final_coords = dense_coords + (normals * displacement)
+        
+    #     return LineString(final_coords)
+
+
+
+    def _fractalize_geometry(self, 
+                             geometry: LineString, 
+                             roughness: float, 
+                             resolution: float, 
+                             deflection_scale: float) -> LineString:
         """
-        coords = np.array(geometry.coords)
-        if len(coords) < 2: return geometry
+        Fractalizes a line using Geometric Recursive Subdivision (Midpoint Displacement).
+        This guarantees jaggedness by forcing splits until 'resolution' is met.
+        """
+        original_coords = list(geometry.coords)
+        if len(original_coords) < 2: 
+            return geometry
 
-        vectors = coords[1:] - coords[:-1]
-        midpoints = (coords[:-1] + coords[1:]) * 0.5
-        
-        # Perpendiculars (-y, x)
-        perp = np.empty_like(vectors)
-        perp[:, 0] = -vectors[:, 1]
-        perp[:, 1] = vectors[:, 0]
-        
-        rng = np.random.uniform(-1.0, 1.0, size=(len(vectors), 1))
-        
-        # Displacement
-        displaced_mids = midpoints + (perp * (roughness * rng))
-        
-        # Interleave
-        new_count = len(coords) + len(displaced_mids)
-        result = np.empty((new_count, 2), dtype=coords.dtype)
-        result[0::2] = coords
-        result[1::2] = displaced_mids
-        
-        return LineString(result)
-        return LineString(result_coords)
+        # We treat the total length as the baseline for deflection scaling
+        total_length = geometry.length
+        if total_length == 0: return geometry
 
+        # Helper for recursive subdivision
+        def subdivide(p1, p2):
+            # Calculate segment vector and length
+            vec = p2 - p1
+            length = np.linalg.norm(vec)
+            
+            # STOP CONDITION: If segment is small enough, return it (end point only)
+            if length < resolution:
+                return [p2]
+
+            # 1. Find Midpoint
+            mid = p1 + (vec * 0.5)
+            
+            # 2. Calculate Normal (-y, x)
+            # Normalize it to unit length
+            normal = np.array([-vec[1], vec[0]])
+            normal /= (length + 1e-9) # Avoid div/0
+
+            # 3. Calculate Displacement Amount
+            # We scale the deflection by the segment's proportion of the total length.
+            # This ensures big bends on big segments, small bumps on small segments.
+            # Formula: Random(-1, 1) * Roughness * Scale * (Local_Len / Total_Len)
+            # Added a sqrt to (Local/Total) to make decay slightly less aggressive (more crumple)
+            scale_factor = (length / total_length) ** 0.6 
+            amplitude = np.random.uniform(-1.0, 1.0) * roughness * deflection_scale * scale_factor
+            
+            displaced_mid = mid + (normal * amplitude)
+            
+            # 4. Recurse
+            # Return: [Left_Half_Points] + [Right_Half_Points]
+            return subdivide(p1, displaced_mid) + subdivide(displaced_mid, p2)
+
+        # Execute on all initial segments of the LineString
+        new_coords = [np.array(original_coords[0])] # Start with first point
+        
+        for i in range(len(original_coords) - 1):
+            p_start = np.array(original_coords[i])
+            p_end = np.array(original_coords[i+1])
+            
+            # Recursively fill the gap
+            segment_points = subdivide(p_start, p_end)
+            new_coords.extend(segment_points)
+
+        return LineString(new_coords)
+
+
+
+    
     
     def _select_spur_location(self, parent_geo: LineString) -> Tuple[float, float, float]:
         """
